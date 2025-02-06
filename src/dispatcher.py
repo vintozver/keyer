@@ -14,8 +14,10 @@ import typing
 
 from adafruit_character_lcd.character_lcd import Character_LCD_RGB
 from adafruit_pn532.adafruit_pn532 import PN532
+import ecdsa
 
 from . import utils as _utils
+
 
 class Box(object):
     def __init__(self, value):
@@ -26,12 +28,24 @@ class Dispatcher(object):
     IDLE_STANDBY = 0
     IDLE_DATETIME = 1
 
+    # https://blog.linuxgemini.space/derive-pk-of-nxp-mifare-classic-ev1-ecdsa-signature
+    # https://github.com/MichaelsPlayground/NfcMifareClassicEv1VerifyOriginalitySignature/blob/master/app/src/main/java/de/androidcrypto/nfcmifareclassicev1verifyoriginalitysignature/MainActivity.java#L53
+    SIG_PK_NXP_MIFARE_CLASSIC_EV1 = binascii.unhexlify("044F6D3F294DEA5737F0F46FFEE88A356EED95695DD7E0C27A591E6F6F65962BAF")
+
     def __init__(self, lcd: Character_LCD_RGB, pn532: PN532, buzzer: gpiozero.TonalBuzzer, relay: gpiozero.LED):
         self.shutdown_event = threading.Event()
         self.lcd = lcd
         self.pn532 = pn532
         self.buzzer = buzzer
         self.relay = relay
+        self.card_sig_validator = ecdsa.VerifyingKey.from_public_point(
+            ecdsa.ellipticcurve.Point(
+                ecdsa.SECP128r1.curve,
+                int.from_bytes(self.SIG_PK_NXP_MIFARE_CLASSIC_EV1[1:17]),
+                int.from_bytes(self.SIG_PK_NXP_MIFARE_CLASSIC_EV1[17:]),
+            ),
+            curve=ecdsa.SECP128r1
+        )
 
         try:
             with open("authorized_cards.bin", "rb") as f:
@@ -87,13 +101,21 @@ class Dispatcher(object):
         self.lcd.message = "%04d-%02d-%02d %02d:%02d\nTAP CARD ...    " % (dt.year, dt.month, dt.day, dt.hour, dt.minute)
         self.lcd.color = (0, 0, 100)
 
-    def render_granted(self, description: typing.Annotated[str, 4], flags: typing.Annotated[str, 16]):
-        self.lcd.message = "WELCOME     %4s\n%16s" % (description, flags)
-        self.lcd.color = (0, 100, 0)
-        self.relay.blink(on_time=2.0, off_time=1.0, n=1, background=True)
-        self.buzzer.play(220)
-        time.sleep(1)
-        self.buzzer.stop()
+    def render_granted(self, description: typing.Annotated[str, 4], flags: typing.Annotated[str, 16], remote: bool = False):
+        if remote:
+            self.lcd.message = "REMOTE UNL  %4s\n%16s" % (description, flags)
+            self.lcd.color = (100, 100, 0)
+            self.relay.blink(on_time=5.0, off_time=1.0, n=1, background=True)
+            self.buzzer.play(220)
+            time.sleep(1)
+            self.buzzer.stop()
+        else:
+            self.lcd.message = "WELCOME     %4s\n%16s" % (description, flags)
+            self.lcd.color = (0, 100, 0)
+            self.relay.blink(on_time=2.0, off_time=1.0, n=1, background=True)
+            self.buzzer.play(220)
+            time.sleep(1)
+            self.buzzer.stop()
 
     def render_denied(self, reason: typing.Annotated[str, 16]):
         self.lcd.message = "UNAUTHORIZED    \n%16s" % (reason[:16] or "")
@@ -101,6 +123,27 @@ class Dispatcher(object):
         self.buzzer.play(440)
         time.sleep(1)
         self.buzzer.stop()
+
+    def remote_admit(self, email: str):
+        user = self.users.get(email)
+        if user is not None:
+            unit_number = user[1]
+            flags = user[2]
+            if flags[1:2] == b'*':
+                self.render_granted(unit_number, flags.decode('ascii'), remote=True)
+            elif flags[1:2] == b'S':
+                if flags[2:4] == b'00':
+                    dt = datetime.datetime.now()
+                    if dt.hour >= 8 and dt.hour < 20:
+                        self.render_granted(unit_number, flags.decode('ascii'), remote=True)
+                    else:
+                        self.render_denied("time limit")
+                else:
+                    self.render_denied("invalid schedule")
+            else:
+                self.render_denied("unknown flag")
+        else:
+            self.render_denied("unknown user")
 
     def personalize_card(self, email: str, description: typing.Annotated[str, 16]) -> bool:
         lcd = self.lcd
@@ -274,71 +317,7 @@ class Dispatcher(object):
 
         card_uid = pn532.read_passive_target(timeout=5)
         if card_uid is not None:
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                title1 = pn532.mifare_classic_read_block(1)
-            else:
-                title1 = None
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                title2 = pn532.mifare_classic_read_block(2)
-            else:
-                title2 = None
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                email_hash_h = pn532.mifare_classic_read_block(5)
-            else:
-                email_hash_h = None
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                email_hash_l = pn532.mifare_classic_read_block(6)
-            else:
-                email_hash_l = None
-
-            if (email_hash_l is not None and email_hash_h is not None):
-                email_hash = email_hash_h + email_hash_l
-            else:
-                email_hash = None
-
-            if email_hash is not None:
-                authorized_card = self.authorized_cards.get(email_hash)
-                if authorized_card is not None:
-                    email = authorized_card[0]
-                    access_key_B = authorized_card[1]
-
-                    # attempt to read block4 with unit_number and flags
-                    # this is merely an authentication of the card
-                    # all permissions are enforced by the database
-                    if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
-                        description = pn532.mifare_classic_read_block(4)
-                    else:
-                        description = None
-
-                    if description is not None:
-                        # now check the user from the database
-                        user = self.users.get(email)
-                        if user is not None:
-                            unit_number = user[1]
-                            flags = user[2]
-                            if flags[1:2] == b'*':
-                                self.render_granted(unit_number, flags.decode('ascii'))
-                            elif flags[1:2] == b'S':
-                                if flags[2:4] == b'00':
-                                    dt = datetime.datetime.now()
-                                    if dt.hour >= 8 and dt.hour < 20:
-                                        self.render_granted(unit_number, flags.decode('ascii'))
-                                    else:
-                                        self.render_denied("time limit")
-                                else:
-                                    self.render_denied("invalid schedule")
-                            else:
-                                self.render_denied("unknown flag")
-                        else:
-                            self.render_denied("unknown user")
-                    else:
-                        self.render_denied("card key X")
-                else:
-                    # card not authorized properly
-                    # email_hash must have a match of email & acces_key_B
-                    self.render_denied("unknown card")
-            else:
-                self.render_denied("invalid card")
+            self.idle_card_tap_process(card_uid)
 
             while pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
                 time.sleep(1)
@@ -348,6 +327,93 @@ class Dispatcher(object):
         else:
             self.idle_screen = (self.idle_screen + 1) % 2
 
+    def idle_card_tap_process(self, card_uid: bytes):
+        pn532 = self.pn532
+
+        # NXP originality check
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 69, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
+            card_sig_r = pn532.mifare_classic_read_block(69)
+        else:
+            card_sig_r = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 70, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
+            card_sig_s = pn532.mifare_classic_read_block(70)
+        else:
+            card_sig_s = None
+        if (card_sig_r is not None) and (card_sig_s is not None):
+            try:
+                self.card_sig_validator.verify_digest((card_sig_r, card_sig_s), card_uid, sigdecode=ecdsa.util.sigdecode_strings)
+            except ecdsa.keys.BadSignatureError:
+                self.render_denied("fake card (sigX)")
+                return
+        else:
+            self.render_denied("fake card (sig-)")
+            return
+
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            title1 = pn532.mifare_classic_read_block(1)
+        else:
+            title1 = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            title2 = pn532.mifare_classic_read_block(2)
+        else:
+            title2 = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            email_hash_h = pn532.mifare_classic_read_block(5)
+        else:
+            email_hash_h = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            email_hash_l = pn532.mifare_classic_read_block(6)
+        else:
+            email_hash_l = None
+
+        if (email_hash_l is not None and email_hash_h is not None):
+            email_hash = email_hash_h + email_hash_l
+        else:
+            self.render_denied("invalid card")
+            return
+
+        authorized_card = self.authorized_cards.get(email_hash)
+        if authorized_card is None:
+            # card not authorized properly
+            # email_hash must have a match of email & acces_key_B
+            self.render_denied("unknown card")
+            return
+
+        email = authorized_card[0]
+        access_key_B = authorized_card[1]
+
+        # attempt to read block4 with unit_number and flags
+        # this is merely an authentication of the card
+        # all permissions are enforced by the database
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
+            description = pn532.mifare_classic_read_block(4)
+            if description is None:
+                self.render_denied("card read X")
+                return
+        else:
+            self.render_denied("card authN X")
+            return
+
+        # now check the user from the database
+        user = self.users.get(email)
+        if user is not None:
+            unit_number = user[1]
+            flags = user[2]
+            if flags[1:2] == b'*':
+                self.render_granted(unit_number, flags.decode('ascii'))
+            elif flags[1:2] == b'S':
+                if flags[2:4] == b'00':
+                    dt = datetime.datetime.now()
+                    if dt.hour >= 8 and dt.hour < 20:
+                        self.render_granted(unit_number, flags.decode('ascii'))
+                    else:
+                        self.render_denied("time limit")
+                else:
+                    self.render_denied("invalid schedule")
+            else:
+                self.render_denied("unknown flag")
+        else:
+            self.render_denied("unknown user")
 
     def loop(self):
         lcd = self.lcd
@@ -363,22 +429,33 @@ class Dispatcher(object):
                     email = queue_item[1]
                     ev = queue_item[2]
                     result_box = queue_item[3]
-                    user_entry = self.users.get(email)
-                    if user_entry is not None:
-                        unit_number = user_entry[1]
-                        flags = user_entry[2]
-                        if self.personalize_card(email, unit_number + " " + flags.decode("ascii")):
-                            result_box.value = (True, "complete")
+                    try:
+                        user_entry = self.users.get(email)
+                        if user_entry is not None:
+                            unit_number = user_entry[1]
+                            flags = user_entry[2]
+                            if self.personalize_card(email, unit_number + " " + flags.decode("ascii")):
+                                result_box.value = (True, "complete")
+                            else:
+                                result_box.value = (False, "incomplete")
                         else:
-                            result_box.value = (False, "incomplete") 
-                    else:
-                        result_box.value = (False, "user not found")
-
+                            result_box.value = (False, "user not found")
+                    finally:
+                        ev.set()
                     self.idle_screen = self.IDLE_STANDBY
-                    ev.set()
                     continue
                 elif queue_item[0] == "depersonalize":
                     self.depersonalize_card()
+                    self.idle_screen = self.IDLE_STANDBY
+                    continue
+                elif queue_item[0] == "remote_admit":
+                    email = queue_item[1]
+                    ev = queue_item[2]
+                    result_box = queue_item[3]
+                    try:
+                        self.remote_admit(email)
+                    finally:
+                        ev.set()
                     self.idle_screen = self.IDLE_STANDBY
                     continue
 
@@ -398,7 +475,7 @@ class Dispatcher(object):
         try:
             self.queue.put(("personalize", email, ev, box), block=False)
         except queue.Full:
-            return False
+            return False, "queue full"
 
         ev.wait()
         return box.value
@@ -418,4 +495,15 @@ class Dispatcher(object):
             
             self.store_authorized_cards()
             self.store_revoked_cards()
+
+    def action_remote_admit(self, email: str) -> typing.Tuple[bool, str]:
+        ev = threading.Event()
+        box = Box(None)
+        try:
+            self.queue.put(("remote_admit", email, ev, box), block=False)
+        except queue.Full:
+            return False, "queue_full"
+
+        ev.wait()
+        return box.value
 

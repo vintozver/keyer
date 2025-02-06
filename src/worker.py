@@ -22,6 +22,19 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
         email = self.headers.get('X-Email')
         if email is not None:
             dispatcher_obj = self.server.dispatcher
+            dispatcher_obj.action_remote_admit(email)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"\n")
+        else:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"email is missing\n")
+
+    def do_PUT(self):
+        email = self.headers.get('X-Email')
+        if email is not None:
+            dispatcher_obj = self.server.dispatcher
             result, status = dispatcher_obj.action_personalize(email)
             if result:
                 self.send_response(200)
@@ -99,8 +112,10 @@ def main():
     signal.signal(signal.SIGTERM, signal_term)
 
     http_thread.start()
-    dispatcher_obj.loop()  # blocks forever, until signal is received
-
+    try:
+        dispatcher_obj.loop()  # blocks forever, until signal is received
+    finally:
+        http_srv.shutdown()
 
 if __name__ == '__main__':
     main()
