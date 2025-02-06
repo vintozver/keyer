@@ -5,8 +5,10 @@ import busio
 import gpiozero
 import gpiozero.pins.pigpio
 import http.server
+import os
 import serial
 import signal
+import socketserver
 import sys
 import threading
 import time
@@ -21,8 +23,8 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         email = self.headers.get('X-Email')
         if email is not None:
-            dispatcher_obj = self.server.dispatcher
-            dispatcher_obj.action_remote_admit(email)
+            dispatcher = self.server.dispatcher
+            dispatcher.action_remote_admit(email)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"\n")
@@ -34,8 +36,8 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         email = self.headers.get('X-Email')
         if email is not None:
-            dispatcher_obj = self.server.dispatcher
-            result, status = dispatcher_obj.action_personalize(email)
+            dispatcher = self.server.dispatcher
+            result, status = dispatcher.action_personalize(email)
             if result:
                 self.send_response(200)
             else:
@@ -48,8 +50,8 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"email is missing\n")
 
     def do_DELETE(self):
-        dispatcher_obj = self.server.dispatcher
-        dispatcher_obj.action_depersonalize()
+        dispatcher = self.server.dispatcher
+        dispatcher.action_depersonalize()
         self.send_response(202)
         self.end_headers()
         self.wfile.write(b"\n")
@@ -57,8 +59,8 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         email = self.headers.get('X-Email')
         if email is not None:
-            dispatcher_obj = self.server.dispatcher
-            dispatcher_obj.action_revoke(email)
+            dispatcher = self.server.dispatcher
+            dispatcher.action_revoke(email)
             self.send_response(202)
             self.end_headers()
             self.wfile.write(b"\n")
@@ -68,10 +70,21 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"email is missing\n")
 
 
-class HttpServer(http.server.HTTPServer):
+class HttpServer(socketserver.UnixStreamServer):
     def __init__(self, dispatcher: _dispatcher.Dispatcher):
-        super(HttpServer, self).__init__(('', 8080), HttpRequestHandler)
+        super(HttpServer, self).__init__('http.socket', HttpRequestHandler)
         self.dispatcher = dispatcher
+
+    def get_request(self):
+        request, client_address = super(HttpServer, self).get_request()
+        return (request, ["local", 0])
+
+    def server_close(self):
+        retval = super(HttpServer, self).server_close()
+        try:
+            os.unlink('http.socket')
+        except OSError:
+            pass
 
 
 def main():
@@ -91,19 +104,18 @@ def main():
     pn532 = PN532_UART(ser, debug=False)
     pn532.SAM_configuration()
 
-    dispatcher_obj = _dispatcher.Dispatcher(lcd, pn532, buzzer, relay)
-    http_srv = HttpServer(dispatcher_obj)
+    dispatcher = _dispatcher.Dispatcher(lcd, pn532, buzzer, relay)
+    http_srv = HttpServer(dispatcher)
     def http_thread_worker():
-        return http_srv.serve_forever()
+        with http_srv:
+            http_srv.serve_forever()
     http_thread = threading.Thread(target=http_thread_worker, name="http")
 
     def signal_term(sig, frame):
         lcd.color = (0, 0, 0)
         lcd.message = "UNAVAILABLE     \nplease wait ... "
-        dispatcher_obj.shutdown()
+        dispatcher.shutdown()
         http_srv.shutdown()
-        http_thread.join()
-        sys.exit(0)
 
     def signal_int(sig, frame):
         return signal_term(sig, frame)
@@ -113,9 +125,11 @@ def main():
 
     http_thread.start()
     try:
-        dispatcher_obj.loop()  # blocks forever, until signal is received
+        dispatcher.loop()  # blocks forever, until signal is received
     finally:
+        dispatcher.shutdown()
         http_srv.shutdown()
+    http_thread.join()
 
 if __name__ == '__main__':
     main()
