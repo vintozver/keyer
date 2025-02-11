@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
+import base64
 import binascii
 import datetime
 import gpiozero
 import hashlib
 import os
-import pickle
 import pprint
 import queue
 import threading
@@ -18,6 +18,7 @@ from adafruit_pn532.adafruit_pn532 import PN532
 import ecdsa
 
 from . import utils as _utils
+from . import config as _config
 
 
 class Box(object):
@@ -35,8 +36,8 @@ class Dispatcher(object):
 
     # Mifare Classic EV1 personalization layout
     # block 0 (mfg data)
-    # block 1 ("Aspen Grove")
-    # block 2 ("Game Room")
+    # block 1 (title1)
+    # block 2 (title2)
     # block 3 (sector trailer)
     # block 4 (uuid4 of the card)
     # block 5, 6 (sha256 of the email associated)
@@ -56,7 +57,6 @@ class Dispatcher(object):
         pn532: PN532,
         buzzer: gpiozero.TonalBuzzer,
         relay: gpiozero.LED,
-        validate_sig_mifare_classic_ev1: bool = False,
     ):
         self.shutdown_event = threading.Event()
         self.lcd = lcd
@@ -72,26 +72,12 @@ class Dispatcher(object):
             curve=ecdsa.SECP128r1
         )
 
-        try:
-            with open("issued_cards.bin", "rb") as f:
-                self.issued_cards = pickle.load(f)
-        except FileNotFoundError:
-            self.issued_cards = {
-                # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC)
-            }
-        print("***issued cards ***")
-        print(pprint.pformat(self.issued_cards, width=320))
-
-        try:
-            with open("revoked_cards.bin", "rb") as f:
-                self.revoked_cards = pickle.load(f)
-        except FileNotFoundError:
-            self.revoked_cards = {
-                # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC), dt-revoked(UTC)
-            }
-        print("***revoked cards ***")
-        print(pprint.pformat(self.revoked_cards, width=320))
-
+        self.issued_cards = {
+            # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC)
+        }
+        self.revoked_cards = {
+            # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC), dt-revoked(UTC)
+        }
         self.users = {
             # email -> name, flags, dt-created(UTC)
             # flags (one byte per line)
@@ -99,21 +85,94 @@ class Dispatcher(object):
             #   *(unlimited access), S(scheduled access, 2 bytes scheduler identifier follow)
         }
 
+        if _config.local_storage:
+            try:
+                with open("users.txt", "rt") as f:
+                    for line in f.readlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        items = line.split("\t")
+                        if len(items) != 4:
+                            raise RuntimeError("Unable to parse users.txt")
+                        email = items[0]
+                        name = items[1]
+                        flags = items[2].encode('ascii')
+                        dt = datetime.datetime.fromisoformat(items[3])
+                        self.users[email] = (name, flags, dt)
+            except FileNotFoundError:
+                pass
+            print("***users***")
+            print(pprint.pformat(self.users, width=320))
+
+            try:
+                with open("issued_cards.txt", "rt") as f:
+                    for line in f.readlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        items = line.split("\t")
+                        if len(items) != 4:
+                            raise RuntimeError("Unable to parse users.txt")
+                        identifier = uuid.UUID(items[0])
+                        key_B = base64.b64decode(items[1])
+                        email = items[2]
+                        issued = datetime.datetime.fromisoformat(items[3])
+                        self.issued_cards[identifier] = (key_B, email, issued)
+            except FileNotFoundError:
+                pass
+            print("***issued cards***")
+            print(pprint.pformat(self.issued_cards, width=320))
+
+            try:
+                with open("revoked_cards.txt", "rt") as f:
+                    for line in f.readlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        items = line.split("\t")
+                        if len(items) != 5:
+                            raise RuntimeError("Unable to parse users.txt")
+                        identifier = uuid.UUID(items[0])
+                        key_B = base64.b64decode(items[1])
+                        email = items[2]
+                        issued = datetime.datetime.fromisoformat(items[3])
+                        revoked = datetime.datetime.fromisoformat(items[4])
+                        self.revoked_cards[identifier] = (key_B, email, issued, revoked)
+            except FileNotFoundError:
+                pass
+            print("***revoked cards***")
+            print(pprint.pformat(self.revoked_cards, width=320))
+
         self.queue = queue.Queue(4)
         self.idle_screen = self.IDLE_STANDBY
-        self.validate_sig_mifare_classic_ev1 = validate_sig_mifare_classic_ev1
 
     def shutdown(self):
         self.shutdown_event.set()
 
     def store_issued_cards(self):
-        with open("issued_cards.bin", "wb") as f:
-            pickle.dump(self.issued_cards, f)
+        print("Saving issued_cards.txt\n" + repr(self.issued_cards))
+        with open("issued_cards.txt", "wt") as f:
+            for issued_card in self.issued_cards.items():
+                f.write("%s\t%s\t%s\t%s\n" % (
+                    issued_card[0].hex,
+                    base64.b64encode(issued_card[1][0]).decode('ascii'),
+                    issued_card[1][1],
+                    issued_card[1][2].isoformat(),
+                ))
             f.flush()
 
     def store_revoked_cards(self):
-        with open("revoked_cards.bin", "wb") as f:
-            pickle.dump(self.revoked_cards, f)
+        print("Saving revoked_cards.txt\n" + repr(self.revoked_cards))
+        with open("revoked_cards.txt", "wt") as f:
+            for revoked_card in self.revoked_cards.items():
+                f.write("%s\t%s\t%s\t%s\t%s\n" % (
+                    revoked_card[0].hex,
+                    base64.b64encode(revoked_card[1][0]).decode('ascii'),
+                    revoked_card[1][1],
+                    revoked_card[1][2].isoformat(),
+                    revoked_card[1][3].isoformat(),
+                ))
             f.flush()
 
     def render_idle_standby(self):
@@ -213,13 +272,13 @@ class Dispatcher(object):
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(1, b'Aspen Grove     ')
+                pn532.mifare_classic_write_block(1, _config.title1.strip().ljust(16)[:16].encode('ascii'))
             else:
                 lcd.message = "BLOCK1 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(2, b'Game Room       ')
+                pn532.mifare_classic_write_block(2, _config.title1.strip().ljust(16)[:16].encode('ascii'))
             else:
                 lcd.message = "BLOCK2 NOT AUTHN\nERROR           "
                 ok = False
@@ -342,7 +401,7 @@ class Dispatcher(object):
     def idle_card_tap_process(self, card_uid: bytes):
         pn532 = self.pn532
 
-        if self.validate_sig_mifare_classic_ev1:
+        if _config.validate_sig_mifare_classic_ev1:
             # NXP originality check
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 69, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
                 card_sig_r = pn532.mifare_classic_read_block(69)
@@ -370,16 +429,16 @@ class Dispatcher(object):
             title2 = pn532.mifare_classic_read_block(2)
         else:
             title2 = None
+
         if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
             identifier = pn532.mifare_classic_read_block(4)
-        else:
-            identifier = None
-
-        if identifier is not None:
-            identifier = uuid.UUID(bytes=identifier)
+            if identifier is None:
+                self.render_denied("uuid -")
+                return
         else:
             self.render_denied("uuid X")
             return
+        identifier = uuid.UUID(bytes=identifier)
 
         issued_card = self.issued_cards.get(identifier)
         if issued_card is None:

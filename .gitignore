@@ -1,6 +1,8 @@
 build/
 __pycache__/
 *.egg-info/
-issued_cards.bin
-revoked_cards.bin
+config.txt
+users.txt
+issued_cards.txt
+revoked_cards.txt
 
