@@ -278,7 +278,7 @@ class Dispatcher(object):
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(2, _config.title1.strip().ljust(16)[:16].encode('ascii'))
+                pn532.mifare_classic_write_block(2, _config.title2.strip().ljust(16)[:16].encode('ascii'))
             else:
                 lcd.message = "BLOCK2 NOT AUTHN\nERROR           "
                 ok = False
