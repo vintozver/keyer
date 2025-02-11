@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 import typing
+import uuid
 
 from adafruit_character_lcd.character_lcd import Character_LCD_RGB
 from adafruit_pn532.adafruit_pn532 import PN532
@@ -32,7 +33,22 @@ class Dispatcher(object):
     # https://github.com/MichaelsPlayground/NfcMifareClassicEv1VerifyOriginalitySignature/blob/master/app/src/main/java/de/androidcrypto/nfcmifareclassicev1verifyoriginalitysignature/MainActivity.java#L53
     SIG_PK_NXP_MIFARE_CLASSIC_EV1 = binascii.unhexlify("044F6D3F294DEA5737F0F46FFEE88A356EED95695DD7E0C27A591E6F6F65962BAF")
 
-    def __init__(self, lcd: Character_LCD_RGB, pn532: PN532, buzzer: gpiozero.TonalBuzzer, relay: gpiozero.LED):
+    # Mifare Classic EV1 personalization layout
+    # block 0 (mfg data)
+    # block 1 ("Aspen Grove")
+    # block 2 ("Game Room")
+    # block 3 (sector trailer)
+    # block 4 (uuid4 of the card)
+    # block 5, 6 (sha256 of the email associated)
+    # block 7 (sector trailer)
+
+    def __init__(self,
+        lcd: Character_LCD_RGB,
+        pn532: PN532,
+        buzzer: gpiozero.TonalBuzzer,
+        relay: gpiozero.LED,
+        validate_sig_mifare_classic_ev1: bool = False,
+    ):
         self.shutdown_event = threading.Event()
         self.lcd = lcd
         self.pn532 = pn532
@@ -48,29 +64,27 @@ class Dispatcher(object):
         )
 
         try:
-            with open("authorized_cards.bin", "rb") as f:
-                self.authorized_cards = pickle.load(f)
+            with open("issued_cards.bin", "rb") as f:
+                self.issued_cards = pickle.load(f)
         except FileNotFoundError:
-            self.authorized_cards = {
-                # email_hash -> email, access_key_B(6-byte), dt-created(UTC)
+            self.issued_cards = {
+                # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC)
             }
-
-        print("***authorized cards ***")
-        print(pprint.pformat(self.authorized_cards, width=320))
+        print("***issued cards ***")
+        print(pprint.pformat(self.issued_cards, width=320))
 
         try:
             with open("revoked_cards.bin", "rb") as f:
                 self.revoked_cards = pickle.load(f)
         except FileNotFoundError:
-            self.revoked_cards = [
-                # email_hash, email, access_key_B(6-byte), dt-created(UTC), dt-revoked(UTC)
-            ]
-
+            self.revoked_cards = {
+                # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC), dt-revoked(UTC)
+            }
         print("***revoked cards ***")
         print(pprint.pformat(self.revoked_cards, width=320))
 
         self.users = {
-            # email -> name, unit_number, flags, dt-created(UTC)
+            # email -> name, flags, dt-created(UTC)
             # flags (one byte per line)
             #   O(owner), R(resident)
             #   *(unlimited access), S(scheduled access, 2 bytes scheduler identifier follow)
@@ -78,13 +92,14 @@ class Dispatcher(object):
 
         self.queue = queue.Queue(4)
         self.idle_screen = self.IDLE_STANDBY
+        self.validate_sig_mifare_classic_ev1 = validate_sig_mifare_classic_ev1
 
     def shutdown(self):
         self.shutdown_event.set()
 
-    def store_authorized_cards(self):
-        with open("authorized_cards.bin", "wb") as f:
-            pickle.dump(self.authorized_cards, f)
+    def store_issued_cards(self):
+        with open("issued_cards.bin", "wb") as f:
+            pickle.dump(self.issued_cards, f)
             f.flush()
 
     def store_revoked_cards(self):
@@ -101,21 +116,13 @@ class Dispatcher(object):
         self.lcd.message = "%04d-%02d-%02d %02d:%02d\nTAP CARD ...    " % (dt.year, dt.month, dt.day, dt.hour, dt.minute)
         self.lcd.color = (0, 0, 100)
 
-    def render_granted(self, description: typing.Annotated[str, 4], flags: typing.Annotated[str, 16], remote: bool = False):
-        if remote:
-            self.lcd.message = "REMOTE UNL  %4s\n%16s" % (description, flags)
-            self.lcd.color = (100, 100, 0)
-            self.relay.blink(on_time=5.0, off_time=1.0, n=1, background=True)
-            self.buzzer.play(220)
-            time.sleep(1)
-            self.buzzer.stop()
-        else:
-            self.lcd.message = "WELCOME     %4s\n%16s" % (description, flags)
-            self.lcd.color = (0, 100, 0)
-            self.relay.blink(on_time=2.0, off_time=1.0, n=1, background=True)
-            self.buzzer.play(220)
-            time.sleep(1)
-            self.buzzer.stop()
+    def render_granted(self, identifier: uuid.UUID, flags: typing.Annotated[str, 16]):
+        self.lcd.message = "WELCOME %8s\n%16s" % (identifier.bytes[-4:].hex(), flags)
+        self.lcd.color = (0, 100, 0)
+        self.relay.blink(on_time=2.0, off_time=1.0, n=1, background=True)
+        self.buzzer.play(220)
+        time.sleep(1)
+        self.buzzer.stop()
 
     def render_denied(self, reason: typing.Annotated[str, 16]):
         self.lcd.message = "UNAUTHORIZED    \n%16s" % (reason[:16] or "")
@@ -124,18 +131,25 @@ class Dispatcher(object):
         time.sleep(1)
         self.buzzer.stop()
 
+    def render_remote_admit(self, flags: typing.Annotated[str, 16]):
+        self.lcd.message = "REMOTE UNLOCK   \n%16s" % flags
+        self.lcd.color = (100, 100, 0)
+        self.relay.blink(on_time=5.0, off_time=1.0, n=1, background=True)
+        self.buzzer.play(220)
+        time.sleep(1)
+        self.buzzer.stop()
+
     def remote_admit(self, email: str):
         user = self.users.get(email)
         if user is not None:
-            unit_number = user[1]
-            flags = user[2]
+            flags = user[1]
             if flags[1:2] == b'*':
-                self.render_granted(unit_number, flags.decode('ascii'), remote=True)
+                self.render_remote_admit(flags.decode('ascii'))
             elif flags[1:2] == b'S':
                 if flags[2:4] == b'00':
                     dt = datetime.datetime.now()
                     if dt.hour >= 8 and dt.hour < 20:
-                        self.render_granted(unit_number, flags.decode('ascii'), remote=True)
+                        self.render_remote_admit(flags.decode('ascii'))
                     else:
                         self.render_denied("time limit")
                 else:
@@ -145,91 +159,91 @@ class Dispatcher(object):
         else:
             self.render_denied("unknown user")
 
-    def personalize_card(self, email: str, description: typing.Annotated[str, 16]) -> bool:
+    def personalize_card(self, email: str) -> uuid.UUID:
         lcd = self.lcd
         pn532 = self.pn532
+
+        email_hash = hashlib.sha256(email.encode('utf-8')).digest()
 
         lcd.message = "PERSONALIZING   \nTAP CARD ...    "
         lcd.color = (100, 100, 100)
         ok = True
-        email_hash = hashlib.sha256(email.encode('utf-8')).digest()
-        authorized_card_record = self.authorized_cards.get(email_hash)
-        if authorized_card_record is not None:
-            if authorized_card_record[0] == email:
-                access_key_B = authorized_card_record[1]
-            else:
-                lcd.message = "email mismatch  \nERROR           "
-                time.sleep(5)
-                return
-        else:
-            access_key_B = os.urandom(6)
-            self.authorized_cards[email_hash] = (email, access_key_B, datetime.datetime.utcnow())
-            self.store_authorized_cards()
 
         card_uid = pn532.read_passive_target(timeout=5)
-        if card_uid is not None:
-            lcd.message = "CARD %11s\nWRITING ...     " % binascii.hexlify(card_uid).decode('ascii')
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 3, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                    acl = _utils.access_bits_to_seq(
-                        0, 0, 0,  # block 0 (mfg data)
-                        1, 0, 0,  # block 1
-                        1, 0, 0,  # block 2
-                        0, 1, 1,  # block 3 (sector trailer)
-                    )
-                    pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
-                else:
-                    lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 7, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                    acl = _utils.access_bits_to_seq(
-                        0, 1, 1,  # block 4
-                        1, 0, 0,  # block 5
-                        1, 0, 0,  # block 6
-                        0, 1, 1,  # block 7 (sector trailer)
-                    )
-                    pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
-                else:
-                    lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x61, access_key_B):
-                    pn532.mifare_classic_write_block(1, b'Aspen Grove     ')
-                else:
-                    lcd.message = "BLOCK1 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x61, access_key_B):
-                    pn532.mifare_classic_write_block(2, b'Game Room       ')
-                else:
-                    lcd.message = "BLOCK2 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
-                    pn532.mifare_classic_write_block(4, description.ljust(16)[:16].encode('ascii'))
-                else:
-                    lcd.message = "BLOCK4 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x61, access_key_B):
-                    pn532.mifare_classic_write_block(5, email_hash[:16])
-                else:
-                    lcd.message = "BLOCK5 NOT AUTHN\nERROR           "
-                    ok = False
-            if ok:
-                if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x61, access_key_B):
-                    pn532.mifare_classic_write_block(6, email_hash[16:])
-                else:
-                    lcd.message = "BLOCK6 NOT AUTHN\nERROR           "
-                    ok = False
+        if card_uid is None:
+            return False
 
-        if (card_uid is not None) and ok:
+        identifier = uuid.uuid4()
+        access_key_B = os.urandom(6)
+
+        lcd.message = "CARD %11s\nWRITING ...     " % binascii.hexlify(card_uid).decode('ascii')
+
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 3, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+                acl = _utils.access_bits_to_seq(
+                    0, 0, 0,  # block 0 (mfg data)
+                    1, 0, 0,  # block 1
+                    1, 0, 0,  # block 2
+                    0, 1, 1,  # block 3 (sector trailer)
+                )
+                pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
+            else:
+                lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 7, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+                acl = _utils.access_bits_to_seq(
+                    1, 0, 0,  # block 4
+                    0, 1, 1,  # block 5
+                    0, 1, 1,  # block 6
+                    0, 1, 1,  # block 7 (sector trailer)
+                )
+                pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
+            else:
+                lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x61, access_key_B):
+                pn532.mifare_classic_write_block(1, b'Aspen Grove     ')
+            else:
+                lcd.message = "BLOCK1 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x61, access_key_B):
+                pn532.mifare_classic_write_block(2, b'Game Room       ')
+            else:
+                lcd.message = "BLOCK2 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
+                pn532.mifare_classic_write_block(4, identifier.bytes)
+            else:
+                lcd.message = "BLOCK4 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x61, access_key_B):
+                pn532.mifare_classic_write_block(5, email_hash[:16])
+            else:
+                lcd.message = "BLOCK5 NOT AUTHN\nERROR           "
+                ok = False
+        if ok:
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x61, access_key_B):
+                pn532.mifare_classic_write_block(6, email_hash[16:])
+            else:
+                lcd.message = "BLOCK6 NOT AUTHN\nERROR           "
+                ok = False
+
+        if ok:
+            self.issued_cards[identifier] = (access_key_B, email, datetime.datetime.utcnow())
+            self.store_issued_cards()
+
             lcd.message = "PERSONALIZING OK\nREMOVE CARD ... "
             time.sleep(5)
             lcd.color = (0, 0, 0)
-            return True
+            return identifier
         else:
+            time.sleep(5)
+            lcd.color = (0, 0, 0)
             return False
 
     def depersonalize_card(self):
@@ -241,40 +255,29 @@ class Dispatcher(object):
 
         card_uid = pn532.read_passive_target(timeout=5)
         if card_uid is not None:
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                email_hash_h = pn532.mifare_classic_read_block(5)
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+                identifier = pn532.mifare_classic_read_block(4)
             else:
-                email_hash_h = None
-            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                email_hash_l = pn532.mifare_classic_read_block(6)
-            else:
-                email_hash_l = None
+                identifier = None
 
-            if (email_hash_l is not None and email_hash_h is not None):
-                email_hash = email_hash_h + email_hash_l
-            else:
-                email_hash = None
+            if identifier is not None:
+                identifier = uuid.UUID(bytes=identifier)
 
-            if email_hash is not None:
-                success = False
-                authorized_card = self.authorized_cards.get(email_hash)
-                if authorized_card is not None:  # found authorized card
-                    email = authorized_card[0]
-                    access_key_B = authorized_card[1]
-                    if self.depersonalize_card_by_key(card_uid, access_key_B):
+                issued_card = self.issued_cards.get(identifier)
+                if issued_card is not None:
+                    access_key_B = issued_card[0]
+                    if self.depersonalize_card_impl(card_uid, access_key_B):
+                        del self.issued_cards[identifier]
+                        self.store_issued_cards()
                         success = True
-                if not success:
-                    # try revoked cards
-                    for access_key_B in map(
-                        lambda map_item: map_item[2],
-                        filter(
-                            lambda filter_item: filter_item[0] == email_hash,
-                            self.revoked_cards
-                        )
-                    ):
-                        if self.depersonalize_card_by_key(card_uid, access_key_B):
+                else:
+                    revoked_card = self.revoked_cards.get(identifier)
+                    if revoked_card is not None:
+                        access_key_B = revoked_card[0]
+                        if self.depersonalize_card_impl(card_uid, access_key_B):
+                            del self.revoked_cards[identifier]
+                            self.store_revoked_cards()
                             success = True
-                            break
                 if success:
                     lcd.message = "FORMAT ACK      \nREMOVE CARD ... "
                 else:
@@ -285,7 +288,7 @@ class Dispatcher(object):
             time.sleep(5)
             lcd.color = (0, 0, 0)
 
-    def depersonalize_card_by_key(self, card_uid: bytes, access_key_B: typing.Annotated[bytes, 6]) -> bool:
+    def depersonalize_card_impl(self, card_uid: bytes, access_key_B: typing.Annotated[bytes, 6]) -> bool:
         pn532 = self.pn532
 
         if pn532.mifare_classic_authenticate_block(card_uid[-4:], 3, 0x61, access_key_B):
@@ -330,24 +333,25 @@ class Dispatcher(object):
     def idle_card_tap_process(self, card_uid: bytes):
         pn532 = self.pn532
 
-        # NXP originality check
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 69, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
-            card_sig_r = pn532.mifare_classic_read_block(69)
-        else:
-            card_sig_r = None
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 70, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
-            card_sig_s = pn532.mifare_classic_read_block(70)
-        else:
-            card_sig_s = None
-        if (card_sig_r is not None) and (card_sig_s is not None):
-            try:
-                self.card_sig_validator.verify_digest((card_sig_r, card_sig_s), card_uid, sigdecode=ecdsa.util.sigdecode_strings)
-            except ecdsa.keys.BadSignatureError:
-                self.render_denied("fake card (sigX)")
+        if self.validate_sig_mifare_classic_ev1:
+            # NXP originality check
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 69, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
+                card_sig_r = pn532.mifare_classic_read_block(69)
+            else:
+                card_sig_r = None
+            if pn532.mifare_classic_authenticate_block(card_uid[-4:], 70, 0x61, b'\x4b\x79\x1b\xea\x7b\xcc'):
+                card_sig_s = pn532.mifare_classic_read_block(70)
+            else:
+                card_sig_s = None
+            if (card_sig_r is not None) and (card_sig_s is not None):
+                try:
+                    self.card_sig_validator.verify_digest((card_sig_r, card_sig_s), card_uid, sigdecode=ecdsa.util.sigdecode_strings)
+                except ecdsa.keys.BadSignatureError:
+                    self.render_denied("fake card (sigX)")
+                    return
+            else:
+                self.render_denied("fake card (sig-)")
                 return
-        else:
-            self.render_denied("fake card (sig-)")
-            return
 
         if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
             title1 = pn532.mifare_classic_read_block(1)
@@ -357,55 +361,57 @@ class Dispatcher(object):
             title2 = pn532.mifare_classic_read_block(2)
         else:
             title2 = None
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            email_hash_h = pn532.mifare_classic_read_block(5)
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            identifier = pn532.mifare_classic_read_block(4)
         else:
-            email_hash_h = None
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            email_hash_l = pn532.mifare_classic_read_block(6)
-        else:
-            email_hash_l = None
+            identifier = None
 
-        if (email_hash_l is not None and email_hash_h is not None):
-            email_hash = email_hash_h + email_hash_l
+        if identifier is not None:
+            identifier = uuid.UUID(bytes=identifier)
         else:
-            self.render_denied("invalid card")
+            self.render_denied("uuid X")
             return
 
-        authorized_card = self.authorized_cards.get(email_hash)
-        if authorized_card is None:
-            # card not authorized properly
-            # email_hash must have a match of email & acces_key_B
+        issued_card = self.issued_cards.get(identifier)
+        if issued_card is None:
             self.render_denied("unknown card")
             return
 
-        email = authorized_card[0]
-        access_key_B = authorized_card[1]
+        access_key_B = issued_card[0]
+        email = issued_card[1]
 
-        # attempt to read block4 with unit_number and flags
-        # this is merely an authentication of the card
-        # all permissions are enforced by the database
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
-            description = pn532.mifare_classic_read_block(4)
-            if description is None:
-                self.render_denied("card read X")
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x61, access_key_B):
+            email_hash_h = pn532.mifare_classic_read_block(5)
+            if email_hash_h is None:
+                self.render_denied("email hash H-")
                 return
         else:
-            self.render_denied("card authN X")
+            self.render_denied("email hash HX")
+            return
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x61, access_key_B):
+            email_hash_l = pn532.mifare_classic_read_block(6)
+            if email_hash_l is None:
+                self.render_denied("email hash L-")
+                return
+        else:
+            self.render_denied("email hash LX")
+            return
+
+        if (email_hash_h + email_hash_l) != hashlib.sha256(email.encode('utf-8')).digest():
+            self.render_denied("email hash !")
             return
 
         # now check the user from the database
         user = self.users.get(email)
         if user is not None:
-            unit_number = user[1]
-            flags = user[2]
+            flags = user[1]
             if flags[1:2] == b'*':
-                self.render_granted(unit_number, flags.decode('ascii'))
+                self.render_granted(identifier, flags.decode('ascii'))
             elif flags[1:2] == b'S':
                 if flags[2:4] == b'00':
                     dt = datetime.datetime.now()
                     if dt.hour >= 8 and dt.hour < 20:
-                        self.render_granted(unit_number, flags.decode('ascii'))
+                        self.render_granted(identifier, flags.decode('ascii'))
                     else:
                         self.render_denied("time limit")
                 else:
@@ -432,9 +438,8 @@ class Dispatcher(object):
                     try:
                         user_entry = self.users.get(email)
                         if user_entry is not None:
-                            unit_number = user_entry[1]
-                            flags = user_entry[2]
-                            if self.personalize_card(email, unit_number + " " + flags.decode("ascii")):
+                            flags = user_entry[1]
+                            if self.personalize_card(email):
                                 result_box.value = (True, "complete")
                             else:
                                 result_box.value = (False, "incomplete")
@@ -486,14 +491,13 @@ class Dispatcher(object):
         except queue.Full:
             pass
 
-    def action_revoke(self, email: str) -> None:
-        email_hash = hashlib.sha256(email.encode('utf-8')).digest()
-        authorized_card = self.authorized_cards.get(email_hash)
-        if authorized_card is not None:
-            self.revoked_cards.append((email_hash, ) + authorized_card + (datetime.datetime.utcnow(), ))
-            del self.authorized_cards[email_hash]
+    def action_revoke(self, identifier: uuid.UUID) -> None:
+        issued_card = self.issued_cards.get(identifier)
+        if issued_card is not None:
+            del self.issued_cards[identifier]
+            self.revoked_cards[identifier] = issued_card + (datetime.datetime.utcnow(), )
             
-            self.store_authorized_cards()
+            self.store_issued_cards()
             self.store_revoked_cards()
 
     def action_remote_admit(self, email: str) -> typing.Tuple[bool, str]:

@@ -12,6 +12,7 @@ import socketserver
 import sys
 import threading
 import time
+import uuid
 
 from adafruit_pn532.uart import PN532_UART
 import adafruit_character_lcd.character_lcd_rgb_i2c as character_lcd
@@ -57,17 +58,17 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"\n")
 
     def do_PATCH(self):
-        email = self.headers.get('X-Email')
-        if email is not None:
+        identifier = self.headers.get('X-Card-UUID')
+        if identifier is not None:
             dispatcher = self.server.dispatcher
-            dispatcher.action_revoke(email)
+            dispatcher.action_revoke(uuid.UUID(identifier))
             self.send_response(202)
             self.end_headers()
             self.wfile.write(b"\n")
         else:
             self.send_response(400)
             self.end_headers()
-            self.wfile.write(b"email is missing\n")
+            self.wfile.write(b"card uuid is missing\n")
 
 
 class HttpServer(socketserver.UnixStreamServer):

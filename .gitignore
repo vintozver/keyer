@@ -1,6 +1,6 @@
 build/
 __pycache__/
 *.egg-info/
-authorized_cards.bin
+issued_cards.bin
 revoked_cards.bin
 
