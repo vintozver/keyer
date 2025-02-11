@@ -41,6 +41,15 @@ class Dispatcher(object):
     # block 4 (uuid4 of the card)
     # block 5, 6 (sha256 of the email associated)
     # block 7 (sector trailer)
+    # ---
+    # blocks 1, 2, 3, 4, 7 - allow read by key_A (default, 0xFFFFFFFFFFFF), allow write by key_B (generated, stored)
+    # blocks 5, 6 - allow read/write by key_B only (to allow authN)
+    # Program will read blocks 1, 2 - using default key_A, validating titles
+    # Then, will read block 4 to obtain the card UUID
+    # Then, will go to the database to locate the access record (containing key_B, email, policy)
+    # Then, will read blocks 5, 6 authN with key_B, affirming that the card is issued by us
+    # Then, will compare the email_hash with the values of block 5, 6 - affirming correct usage
+    # Then, will allow/deny access based on the policy
 
     def __init__(self,
         lcd: Character_LCD_RGB,
