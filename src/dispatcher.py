@@ -227,7 +227,7 @@ class Dispatcher(object):
         else:
             self.render_denied("unknown user")
 
-    def personalize_card(self, email: str) -> uuid.UUID:
+    def personalize_card(self, email: str) -> typing.Optional[tuple[uuid.UUID, bytes, datetime.datetime]]:
         lcd = self.lcd
         pn532 = self.pn532
 
@@ -235,17 +235,17 @@ class Dispatcher(object):
 
         lcd.message = "PERSONALIZING   \nTAP CARD ...    "
         lcd.color = (100, 100, 100)
-        ok = True
 
         card_uid = pn532.read_passive_target(timeout=5)
         if card_uid is None:
-            return False
+            return None
 
         identifier = uuid.uuid4()
         access_key_B = os.urandom(6)
+        dt = datetime.datetime.now(tz=datetime.UTC)
 
+        ok = True
         lcd.message = "CARD %11s\nWRITING ...     " % binascii.hexlify(card_uid).decode('ascii')
-
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 3, 0x60, b'\xff\xff\xff\xff\xff\xff'):
                 acl = _utils.access_bits_to_seq(
@@ -302,19 +302,19 @@ class Dispatcher(object):
                 ok = False
 
         if ok:
-            self.issued_cards[identifier] = (access_key_B, email, datetime.datetime.utcnow())
+            self.issued_cards[identifier] = (access_key_B, email, dt)
             self.store_issued_cards()
 
             lcd.message = "PERSONALIZING OK\nREMOVE CARD ... "
             time.sleep(5)
             lcd.color = (0, 0, 0)
-            return identifier
+            return identifier, access_key_B, dt
         else:
             time.sleep(5)
             lcd.color = (0, 0, 0)
-            return False
+            return None
 
-    def depersonalize_card(self):
+    def depersonalize_card(self) -> typing.Optional[uuid.UUID]:
         lcd = self.lcd
         pn532 = self.pn532
 
@@ -323,6 +323,8 @@ class Dispatcher(object):
 
         card_uid = pn532.read_passive_target(timeout=5)
         if card_uid is not None:
+            success = False
+
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
                 identifier = pn532.mifare_classic_read_block(4)
             else:
@@ -355,6 +357,11 @@ class Dispatcher(object):
 
             time.sleep(5)
             lcd.color = (0, 0, 0)
+
+            if success:
+                return identifier
+            else:
+                return None
 
     def depersonalize_card_impl(self, card_uid: bytes, access_key_B: typing.Annotated[bytes, 6]) -> bool:
         pn532 = self.pn532
@@ -507,8 +514,9 @@ class Dispatcher(object):
                         user_entry = self.users.get(email)
                         if user_entry is not None:
                             flags = user_entry[1]
-                            if self.personalize_card(email):
-                                result_box.value = (True, "complete")
+                            result = self.personalize_card(email)
+                            if result:
+                                result_box.value = (True, result)
                             else:
                                 result_box.value = (False, "incomplete")
                         else:
@@ -518,7 +526,12 @@ class Dispatcher(object):
                     self.idle_screen = self.IDLE_STANDBY
                     continue
                 elif queue_item[0] == "depersonalize":
-                    self.depersonalize_card()
+                    ev = queue_item[1]
+                    result_box = queue_item[2]
+                    try:
+                        result_box.value = self.depersonalize_card()
+                    finally:
+                        ev.set()
                     self.idle_screen = self.IDLE_STANDBY
                     continue
                 elif queue_item[0] == "remote_admit":
@@ -542,28 +555,37 @@ class Dispatcher(object):
                 lcd.clear()
                 lcd.color = (0, 0, 0)
 
-    def action_personalize(self, email: str) -> typing.Tuple[bool, str]:
+    def action_personalize(self, email: str) -> typing.Union[
+        tuple[True, tuple[uuid.UUID, bytes, datetime.datetime]],
+        tuple[False, str],
+    ]:
         ev = threading.Event()
         box = Box(None)
         try:
             self.queue.put(("personalize", email, ev, box), block=False)
         except queue.Full:
             return False, "queue full"
-
         ev.wait()
         return box.value
 
-    def action_depersonalize(self) -> None:
+    def action_depersonalize(self) -> typing.Union[
+        tuple[True, uuid.UUID],
+        tuple[False, str],
+    ]:
+        ev = threading.Event()
+        box = Box(None)
         try:
-            self.queue.put(("depersonalize", ), block=False)
+            self.queue.put(("depersonalize", ev, box), block=False)
         except queue.Full:
             pass
+        ev.wait()
+        return box.value
 
     def action_revoke(self, identifier: uuid.UUID) -> None:
         issued_card = self.issued_cards.get(identifier)
         if issued_card is not None:
             del self.issued_cards[identifier]
-            self.revoked_cards[identifier] = issued_card + (datetime.datetime.utcnow(), )
+            self.revoked_cards[identifier] = issued_card + (datetime.datetime.now(tz=datetime.UTC), )
             
             self.store_issued_cards()
             self.store_revoked_cards()

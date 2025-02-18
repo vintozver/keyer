@@ -4,6 +4,7 @@ import board
 import busio
 import gpiozero
 import gpiozero.pins.pigpio
+import json
 import http.server
 import os
 import serial
@@ -40,11 +41,17 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
             dispatcher = self.server.dispatcher
             result, status = dispatcher.action_personalize(email)
             if result:
+                card_uuid, card_mifare_classic_access_key_B, dt = status
                 self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'identifier': card_uuid.hex,
+                    'mifare_classic_access_key_B': card_mifare_classic_access_key_B.hex(),
+                }).encode("utf-8") + b"\n")
             else:
                 self.send_response(404)
-            self.end_headers()
-            self.wfile.write(status.encode("utf-8") + b"\n")
+                self.end_headers()
+                self.wfile.write(status.encode("utf-8") + b"\n")
         else:
             self.send_response(400)
             self.end_headers()
@@ -52,13 +59,18 @@ class HttpRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         dispatcher = self.server.dispatcher
-        dispatcher.action_depersonalize()
-        self.send_response(202)
-        self.end_headers()
-        self.wfile.write(b"\n")
+        result: uuid.UUID = dispatcher.action_depersonalize()
+        if result:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'identifier': result.hex}).encode('utf-8') + b"\n")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"\n")
 
     def do_PATCH(self):
-        identifier = self.headers.get('X-Card-UUID')
+        identifier = self.headers.get('X-Card-Identifier')
         if identifier is not None:
             dispatcher = self.server.dispatcher
             dispatcher.action_revoke(uuid.UUID(identifier))
