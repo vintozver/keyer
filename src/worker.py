@@ -92,15 +92,15 @@ class HttpServer(socketserver.UnixStreamServer):
         request, client_address = super(HttpServer, self).get_request()
         return (request, ["local", 0])
 
-    def server_close(self):
-        retval = super(HttpServer, self).server_close()
-        try:
-            os.unlink('http.socket')
-        except OSError:
-            pass
-
 
 def main():
+    try:
+        os.unlink('http.socket')
+    except OSError:
+        pass
+
+    os.umask(0o0000)
+
     lcd_columns = 16
     lcd_rows = 2
     lcd = character_lcd.Character_LCD_RGB_I2C(busio.I2C(board.SCL, board.SDA), lcd_columns, lcd_rows)
