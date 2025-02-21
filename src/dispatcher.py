@@ -5,9 +5,12 @@ import binascii
 import datetime
 import gpiozero
 import hashlib
+import http.client
+import json
 import os
 import pprint
 import queue
+import ssl
 import threading
 import time
 import typing
@@ -27,8 +30,9 @@ class Box(object):
 
 
 class Dispatcher(object):
-    IDLE_STANDBY = 0
-    IDLE_DATETIME = 1
+    STATE_IDLE_STANDBY = 0
+    STATE_IDLE_DATETIME = 1
+    STATE_WAIT_CONFIG = 2
 
     # https://blog.linuxgemini.space/derive-pk-of-nxp-mifare-classic-ev1-ecdsa-signature
     # https://github.com/MichaelsPlayground/NfcMifareClassicEv1VerifyOriginalitySignature/blob/master/app/src/main/java/de/androidcrypto/nfcmifareclassicev1verifyoriginalitysignature/MainActivity.java#L53
@@ -59,6 +63,7 @@ class Dispatcher(object):
         relay: gpiozero.LED,
     ):
         self.shutdown_event = threading.Event()
+        self.config_event = threading.Event()  # set if config is ready to use
         self.lcd = lcd
         self.pn532 = pn532
         self.buzzer = buzzer
@@ -84,6 +89,8 @@ class Dispatcher(object):
             #   O(owner), R(resident)
             #   *(unlimited access), S(scheduled access, 2 bytes scheduler identifier follow)
         }
+
+        self.queue = queue.Queue(4)
 
         if _config.local_storage:
             try:
@@ -144,13 +151,61 @@ class Dispatcher(object):
             print("***revoked cards***")
             print(pprint.pformat(self.revoked_cards, width=320))
 
-        self.queue = queue.Queue(4)
-        self.idle_screen = self.IDLE_STANDBY
+            self.config_event.set()
+            self.state = self.STATE_IDLE_STANDBY
+        else:
+            self.state = self.STATE_WAIT_CONFIG
+            config_runner = threading.Thread(target=self.config_thread)
+            config_runner.start()
+
+    def config_thread(self):
+        ssl_ctx = ssl.SSLContext()
+        ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
+        while True:
+            http_conn = http.client.HTTPSConnection(_config.control_endpoint, timeout=5, context=ssl_ctx)
+            try:
+                http_conn.request('GET', '/callback/config')
+                http_resp = http_conn.getresponse()
+                if http_resp.status == http.client.OK:
+                    conf = json.load(http_resp)
+                    self.users = dict(map(lambda user: (
+                        user[0],  # email
+                        (
+                            user[1][0],  # name
+                            user[1][1].encode('ascii'),  # flags
+                            datetime.datetime.fromisoformat(user[1][2]),  # created-dt
+                        )
+                    ), conf['users'].items()))
+                    self.issued_cards = dict(map(lambda issued_card: (
+                        uuid.UUID(issued_card[0]),
+                        (
+                            binascii.unhexlify(issued_card[1][0]),  # mifare classic access key B
+                            issued_card[1][1],  # email
+                            datetime.datetime.fromisoformat(issued_card[1][2]),  # created-dt
+                        )
+                    ), conf['issued_cards'].items()))
+                    self.revoked_cards = dict(map(lambda revoked_card: (
+                        uuid.UUID(revoked_card[0]),
+                        (
+                            binascii.unhexlify(revoked_card[1][0]),  # mifare classic access key B
+                            revoked_card[1][1],  # email
+                            datetime.datetime.fromisoformat(revoked_card[1][2]),  # issued-dt
+                            datetime.datetime.fromisoformat(revoked_card[1][3]),  # revoked-dt
+                        )
+                    ), conf['revoked_cards'].items()))
+                    self.revoked_cards = conf['revoked_cards']
+                    break
+            finally:
+                http_conn.close()
+        self.config_event.set()
 
     def shutdown(self):
         self.shutdown_event.set()
 
     def store_issued_cards(self):
+        if not _config.local_storage:
+            return
+
         print("Saving issued_cards.txt\n" + repr(self.issued_cards))
         with open("issued_cards.txt", "wt") as f:
             for issued_card in self.issued_cards.items():
@@ -163,6 +218,9 @@ class Dispatcher(object):
             f.flush()
 
     def store_revoked_cards(self):
+        if not _config.local_storage:
+            return
+
         print("Saving revoked_cards.txt\n" + repr(self.revoked_cards))
         with open("revoked_cards.txt", "wt") as f:
             for revoked_card in self.revoked_cards.items():
@@ -183,6 +241,10 @@ class Dispatcher(object):
         dt = datetime.datetime.now()
         self.lcd.message = "%04d-%02d-%02d %02d:%02d\nTAP CARD ...    " % (dt.year, dt.month, dt.day, dt.hour, dt.minute)
         self.lcd.color = (0, 0, 100)
+
+    def render_state_wait_config(self):
+        self.lcd.message = "waiting for     \nconfig ...      "
+        self.lcd.color = (0, 0, 0)
 
     def render_granted(self, identifier: uuid.UUID, flags: typing.Annotated[str, 16]):
         self.lcd.message = "WELCOME %8s\n%16s" % (identifier.bytes[-4:].hex(), flags)
@@ -401,9 +463,15 @@ class Dispatcher(object):
                 time.sleep(1)
 
             self.lcd.color = (0, 0, 0)
-            self.idle_screen = self.IDLE_STANDBY
+            self.state = self.STATE_IDLE_STANDBY
         else:
-            self.idle_screen = (self.idle_screen + 1) % 2
+            self.state = (self.state + 1) % 2
+
+    def wait_config(self):
+        if self.config_event.wait(timeout=5):
+            self.state = self.STATE_IDLE_STANDBY
+        else:
+            pass
 
     def idle_card_tap_process(self, card_uid: bytes):
         pn532 = self.pn532
@@ -501,6 +569,11 @@ class Dispatcher(object):
         pn532 = self.pn532
 
         while not self.shutdown_event.is_set():
+            if self.state == self.STATE_WAIT_CONFIG:
+                self.render_state_wait_config()
+                self.wait_config()
+                continue
+
             try:
                 queue_item = self.queue.get(block=False)
             except queue.Empty:
@@ -523,7 +596,7 @@ class Dispatcher(object):
                             result_box.value = (False, "user not found")
                     finally:
                         ev.set()
-                    self.idle_screen = self.IDLE_STANDBY
+                    self.state = self.STATE_IDLE_STANDBY
                     continue
                 elif queue_item[0] == "depersonalize":
                     ev = queue_item[1]
@@ -532,7 +605,7 @@ class Dispatcher(object):
                         result_box.value = self.depersonalize_card()
                     finally:
                         ev.set()
-                    self.idle_screen = self.IDLE_STANDBY
+                    self.state = self.STATE_IDLE_STANDBY
                     continue
                 elif queue_item[0] == "remote_admit":
                     email = queue_item[1]
@@ -542,13 +615,13 @@ class Dispatcher(object):
                         self.remote_admit(email)
                     finally:
                         ev.set()
-                    self.idle_screen = self.IDLE_STANDBY
+                    self.state = self.STATE_IDLE_STANDBY
                     continue
 
-            if self.idle_screen == self.IDLE_STANDBY:
+            if self.state == self.STATE_IDLE_STANDBY:
                 self.render_idle_standby()
                 self.wait_tap_cycle()
-            elif self.idle_screen == self.IDLE_DATETIME:
+            elif self.state == self.STATE_IDLE_DATETIME:
                 self.render_idle_datetime()
                 self.wait_tap_cycle()
             else:
