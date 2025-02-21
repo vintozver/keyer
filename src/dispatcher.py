@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 
-import base64
 import binascii
 import datetime
 import gpiozero
 import hashlib
-import http.client
-import json
 import os
-import pprint
 import queue
-import ssl
 import threading
 import time
 import typing
@@ -20,8 +15,9 @@ from adafruit_character_lcd.character_lcd import Character_LCD_RGB
 from adafruit_pn532.adafruit_pn532 import PN532
 import ecdsa
 
-from . import utils as _utils
 from . import config as _config
+from . import storage as _storage
+from . import utils as _utils
 
 
 class Box(object):
@@ -63,7 +59,6 @@ class Dispatcher(object):
         relay: gpiozero.LED,
     ):
         self.shutdown_event = threading.Event()
-        self.config_event = threading.Event()  # set if config is ready to use
         self.lcd = lcd
         self.pn532 = pn532
         self.buzzer = buzzer
@@ -77,161 +72,17 @@ class Dispatcher(object):
             curve=ecdsa.SECP128r1
         )
 
-        self.issued_cards = {
-            # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC)
-        }
-        self.revoked_cards = {
-            # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC), dt-revoked(UTC)
-        }
-        self.users = {
-            # email -> name, flags, dt-created(UTC)
-            # flags (one byte per line)
-            #   O(owner), R(resident)
-            #   *(unlimited access), S(scheduled access, 2 bytes scheduler identifier follow)
-        }
-
         self.queue = queue.Queue(4)
 
         if _config.local_storage:
-            try:
-                with open("users.txt", "rt") as f:
-                    for line in f.readlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        items = line.split("\t")
-                        if len(items) != 4:
-                            raise RuntimeError("Unable to parse users.txt")
-                        email = items[0]
-                        name = items[1]
-                        flags = items[2].encode('ascii')
-                        dt = datetime.datetime.fromisoformat(items[3])
-                        self.users[email] = (name, flags, dt)
-            except FileNotFoundError:
-                pass
-            print("***users***")
-            print(pprint.pformat(self.users, width=320))
-
-            try:
-                with open("issued_cards.txt", "rt") as f:
-                    for line in f.readlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        items = line.split("\t")
-                        if len(items) != 4:
-                            raise RuntimeError("Unable to parse users.txt")
-                        identifier = uuid.UUID(items[0])
-                        key_B = base64.b64decode(items[1])
-                        email = items[2]
-                        issued = datetime.datetime.fromisoformat(items[3])
-                        self.issued_cards[identifier] = (key_B, email, issued)
-            except FileNotFoundError:
-                pass
-            print("***issued cards***")
-            print(pprint.pformat(self.issued_cards, width=320))
-
-            try:
-                with open("revoked_cards.txt", "rt") as f:
-                    for line in f.readlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        items = line.split("\t")
-                        if len(items) != 5:
-                            raise RuntimeError("Unable to parse users.txt")
-                        identifier = uuid.UUID(items[0])
-                        key_B = base64.b64decode(items[1])
-                        email = items[2]
-                        issued = datetime.datetime.fromisoformat(items[3])
-                        revoked = datetime.datetime.fromisoformat(items[4])
-                        self.revoked_cards[identifier] = (key_B, email, issued, revoked)
-            except FileNotFoundError:
-                pass
-            print("***revoked cards***")
-            print(pprint.pformat(self.revoked_cards, width=320))
-
-            self.config_event.set()
-            self.state = self.STATE_IDLE_STANDBY
+            self.storage = _storage.LocalFile()
         else:
-            self.state = self.STATE_WAIT_CONFIG
-            config_runner = threading.Thread(target=self.config_thread)
-            config_runner.start()
+            self.storage = _storage.RemoteHttp()
 
-    def config_thread(self):
-        ssl_ctx = ssl.SSLContext()
-        ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
-        while True:
-            http_conn = http.client.HTTPSConnection(_config.control_endpoint, timeout=5, context=ssl_ctx)
-            try:
-                http_conn.request('GET', '/callback/config')
-                http_resp = http_conn.getresponse()
-                if http_resp.status == http.client.OK:
-                    conf = json.load(http_resp)
-                    self.users = dict(map(lambda user: (
-                        user[0],  # email
-                        (
-                            user[1][0],  # name
-                            user[1][1].encode('ascii'),  # flags
-                            datetime.datetime.fromisoformat(user[1][2]),  # created-dt
-                        )
-                    ), conf['users'].items()))
-                    self.issued_cards = dict(map(lambda issued_card: (
-                        uuid.UUID(issued_card[0]),
-                        (
-                            binascii.unhexlify(issued_card[1][0]),  # mifare classic access key B
-                            issued_card[1][1],  # email
-                            datetime.datetime.fromisoformat(issued_card[1][2]),  # created-dt
-                        )
-                    ), conf['issued_cards'].items()))
-                    self.revoked_cards = dict(map(lambda revoked_card: (
-                        uuid.UUID(revoked_card[0]),
-                        (
-                            binascii.unhexlify(revoked_card[1][0]),  # mifare classic access key B
-                            revoked_card[1][1],  # email
-                            datetime.datetime.fromisoformat(revoked_card[1][2]),  # issued-dt
-                            datetime.datetime.fromisoformat(revoked_card[1][3]),  # revoked-dt
-                        )
-                    ), conf['revoked_cards'].items()))
-                    self.revoked_cards = conf['revoked_cards']
-                    break
-            finally:
-                http_conn.close()
-        self.config_event.set()
+        self.state = self.STATE_WAIT_CONFIG
 
     def shutdown(self):
         self.shutdown_event.set()
-
-    def store_issued_cards(self):
-        if not _config.local_storage:
-            return
-
-        print("Saving issued_cards.txt\n" + repr(self.issued_cards))
-        with open("issued_cards.txt", "wt") as f:
-            for issued_card in self.issued_cards.items():
-                f.write("%s\t%s\t%s\t%s\n" % (
-                    issued_card[0].hex,
-                    base64.b64encode(issued_card[1][0]).decode('ascii'),
-                    issued_card[1][1],
-                    issued_card[1][2].isoformat(),
-                ))
-            f.flush()
-
-    def store_revoked_cards(self):
-        if not _config.local_storage:
-            return
-
-        print("Saving revoked_cards.txt\n" + repr(self.revoked_cards))
-        with open("revoked_cards.txt", "wt") as f:
-            for revoked_card in self.revoked_cards.items():
-                f.write("%s\t%s\t%s\t%s\t%s\n" % (
-                    revoked_card[0].hex,
-                    base64.b64encode(revoked_card[1][0]).decode('ascii'),
-                    revoked_card[1][1],
-                    revoked_card[1][2].isoformat(),
-                    revoked_card[1][3].isoformat(),
-                ))
-            f.flush()
 
     def render_idle_standby(self):
         self.lcd.message = "ASPGR Game Room \nTAP CARD ...    "
@@ -364,8 +215,8 @@ class Dispatcher(object):
                 ok = False
 
         if ok:
-            self.issued_cards[identifier] = (access_key_B, email, dt)
-            self.store_issued_cards()
+            self.storage.issued_cards[identifier] = (access_key_B, email, dt)
+            self.storage.save_issued_cards()
 
             lcd.message = "PERSONALIZING OK\nREMOVE CARD ... "
             time.sleep(5)
@@ -395,20 +246,20 @@ class Dispatcher(object):
             if identifier is not None:
                 identifier = uuid.UUID(bytes=identifier)
 
-                issued_card = self.issued_cards.get(identifier)
+                issued_card = self.storage.issued_cards.get(identifier)
                 if issued_card is not None:
                     access_key_B = issued_card[0]
                     if self.depersonalize_card_impl(card_uid, access_key_B):
-                        del self.issued_cards[identifier]
-                        self.store_issued_cards()
+                        del self.storage.issued_cards[identifier]
+                        self.storage.save_issued_cards()
                         success = True
                 else:
-                    revoked_card = self.revoked_cards.get(identifier)
+                    revoked_card = self.storage.revoked_cards.get(identifier)
                     if revoked_card is not None:
                         access_key_B = revoked_card[0]
                         if self.depersonalize_card_impl(card_uid, access_key_B):
-                            del self.revoked_cards[identifier]
-                            self.store_revoked_cards()
+                            del self.storage.revoked_cards[identifier]
+                            self.storage.save_revoked_cards()
                             success = True
                 if success:
                     lcd.message = "FORMAT ACK      \nREMOVE CARD ... "
@@ -468,7 +319,7 @@ class Dispatcher(object):
             self.state = (self.state + 1) % 2
 
     def wait_config(self):
-        if self.config_event.wait(timeout=5):
+        if self.storage.ready_event.wait(timeout=5):
             self.state = self.STATE_IDLE_STANDBY
         else:
             pass
@@ -515,7 +366,7 @@ class Dispatcher(object):
             return
         identifier = uuid.UUID(bytes=identifier)
 
-        issued_card = self.issued_cards.get(identifier)
+        issued_card = self.storage.issued_cards.get(identifier)
         if issued_card is None:
             self.render_denied("unknown card")
             return
@@ -655,13 +506,13 @@ class Dispatcher(object):
         return box.value
 
     def action_revoke(self, identifier: uuid.UUID) -> None:
-        issued_card = self.issued_cards.get(identifier)
+        issued_card = self.storage.issued_cards.get(identifier)
         if issued_card is not None:
-            del self.issued_cards[identifier]
-            self.revoked_cards[identifier] = issued_card + (datetime.datetime.now(tz=datetime.UTC), )
+            del self.storage.issued_cards[identifier]
+            self.storage.revoked_cards[identifier] = issued_card + (datetime.datetime.now(tz=datetime.UTC), )
             
-            self.store_issued_cards()
-            self.store_revoked_cards()
+            self.storage.save_issued_cards()
+            self.storage.save_revoked_cards()
 
     def action_remote_admit(self, email: str) -> typing.Tuple[bool, str]:
         ev = threading.Event()
