@@ -121,7 +121,7 @@ class Dispatcher(object):
         self.buzzer.stop()
 
     def remote_admit(self, email: str):
-        user = self.users.get(email)
+        user = self.storage.users.get(email)
         if user is not None:
             flags = user[1]
             if flags[1:2] == b'*':
@@ -396,7 +396,7 @@ class Dispatcher(object):
             return
 
         # now check the user from the database
-        user = self.users.get(email)
+        user = self.storage.users.get(email)
         if user is not None:
             flags = user[1]
             if flags[1:2] == b'*':
@@ -435,7 +435,7 @@ class Dispatcher(object):
                     ev = queue_item[2]
                     result_box = queue_item[3]
                     try:
-                        user_entry = self.users.get(email)
+                        user_entry = self.storage.users.get(email)
                         if user_entry is not None:
                             flags = user_entry[1]
                             result = self.personalize_card(email)
