@@ -82,6 +82,7 @@ class Dispatcher(object):
         self.state = self.STATE_WAIT_CONFIG
 
     def shutdown(self):
+        self.storage.shutdown()
         self.shutdown_event.set()
 
     def render_idle_standby(self):
@@ -321,8 +322,10 @@ class Dispatcher(object):
     def wait_config(self):
         if self.storage.ready_event.wait(timeout=5):
             self.state = self.STATE_IDLE_STANDBY
-        else:
-            pass
+
+    def check_config(self):
+        if not self.storage.ready_event.is_set():
+            self.state = self.STATE_WAIT_CONFIG
 
     def idle_card_tap_process(self, card_uid: bytes):
         pn532 = self.pn532
@@ -472,9 +475,11 @@ class Dispatcher(object):
             if self.state == self.STATE_IDLE_STANDBY:
                 self.render_idle_standby()
                 self.wait_tap_cycle()
+                self.check_config()
             elif self.state == self.STATE_IDLE_DATETIME:
                 self.render_idle_datetime()
                 self.wait_tap_cycle()
+                self.check_config()
             else:
                 lcd.clear()
                 lcd.color = (0, 0, 0)

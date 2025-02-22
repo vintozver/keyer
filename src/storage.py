@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import aiohttp
+import asyncio
+import asyncio.events
 import base64
 import binascii
 import datetime
@@ -10,6 +13,7 @@ import ssl
 import sys
 import threading
 import uuid
+import yarl
 
 from . import config as _config
 
@@ -35,6 +39,9 @@ class Base(object):
         raise NotImplementedError
 
     def save_revoked_cards(self):
+        pass
+
+    def shutdown(self):
         pass
 
 
@@ -127,26 +134,38 @@ class LocalFile(Base):
                 ))
             f.flush()
 
+
 class RemoteHttp(Base):
+    CONFIG_INVALIDATE = datetime.timedelta(days=1)
+    CONFIG_FETCH_INTERVAL = datetime.timedelta(minutes=5)
+
     def __init__(self):
         super(RemoteHttp, self).__init__()
+        self.last_config_dt = datetime.datetime.min
+        self._event_loop = asyncio.events.new_event_loop()
+        self.task = asyncio.Task(self._fetch(), loop=self._event_loop)
         config_fetch = threading.Thread(target=self._fetch_thread, name="config_fetch")
         config_fetch.start()
 
-    def _fetch_thread(self):
+    async def _fetch(self):
+        url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/callback/config')
+
         ssl_ctx = ssl.SSLContext()
         ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
-        while True:
-            http_conn = http.client.HTTPSConnection(_config.control_endpoint, timeout=5, context=ssl_ctx)
-            try:
-                http_conn.request('GET', '/callback/config')
-                http_resp = None
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as http_session:
+            while True:
+                conf_bytes = None
                 try:
-                    http_resp = http_conn.getresponse()
-                except OSError as err:
-                    print("Config fetch error: %s | %s | %s" % (type(err), err.errno, err.strerror), file=sys.stderr)
-                if http_resp is not None and http_resp.status == http.client.OK:
-                    conf = json.load(http_resp)
+                    async with http_session.request('GET', url, ssl=ssl_ctx) as http_resp:
+                        if http_resp.status == http.client.OK:
+                            try:
+                                conf_bytes = await http_resp.read()
+                            except aiohttp.ClientResponseError as err:
+                                print('Error fetching config %s' % err)
+                except asyncio.TimeoutError as err_timeout:
+                    print("Config fetch error: %s | %s | %s" % (type(err_timeout), err_timeout.errno, err_timeout.strerror), file=sys.stderr)
+                if conf_bytes is not None:
+                    conf = json.loads(conf_bytes)
                     self.users = dict(map(lambda user: (
                         user[0],  # email
                         (
@@ -172,16 +191,26 @@ class RemoteHttp(Base):
                             datetime.datetime.fromisoformat(revoked_card[1][3]),  # revoked-dt
                         )
                     ), conf['revoked_cards'].items()))
-                    self.revoked_cards = conf['revoked_cards']
-                    break
-            finally:
-                http_conn.close()
+                    self.last_config_dt = datetime.datetime.now(tz=datetime.UTC)
+                    self.ready_event.set()
 
-        self.ready_event.set()
+                if self.ready_event.is_set():
+                    await asyncio.sleep(self.CONFIG_FETCH_INTERVAL.total_seconds())
+                    if datetime.datetime.now(tz=datetime.UTC) - self.last_config_dt > self.CONFIG_INVALIDATE:
+                        self.ready_event.reset()
+
+    def _fetch_thread(self):
+        try:
+            self._event_loop.run_until_complete(self.task)
+        except asyncio.CancelledError:
+            pass
 
     def save_issued_cards(self):
         pass  # not supported/needed
 
     def save_revoked_cards(self):
         pass  # not supported/needed
+
+    def shutdown(self):
+        self.task.cancel()
 

@@ -14,6 +14,6 @@ setup(
     package_dir={'keyer': 'src'},
     install_requires=[
         'adafruit_circuitpython_pn532', 'adafruit_circuitpython_charlcd',
-        'gpiozero', 'pigpio', 'ecdsa',
+        'gpiozero', 'pigpio', 'ecdsa', 'aiodns', 'aiohttp',
     ],
 )
