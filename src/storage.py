@@ -12,6 +12,7 @@ import pprint
 import ssl
 import sys
 import threading
+import typing
 import uuid
 import yarl
 
@@ -141,29 +142,44 @@ class RemoteHttp(Base):
 
     def __init__(self):
         super(RemoteHttp, self).__init__()
-        self.last_config_dt = datetime.datetime.min
+        self._shutdown_event = asyncio.Event()
+        self._last_config_dt = datetime.datetime.min
         self._event_loop = asyncio.events.new_event_loop()
-        self.task = asyncio.Task(self._fetch(), loop=self._event_loop)
+        self._task = asyncio.Task(self._fetch(), loop=self._event_loop)
         config_fetch = threading.Thread(target=self._fetch_thread, name="config_fetch")
         config_fetch.start()
 
+    async def _fetch_once(self, http_session: aiohttp.ClientSession, url: yarl.URL, ssl_ctx: ssl.SSLContext) -> typing.Optional[bytes]:
+        try:
+            async with http_session.request('GET', url, ssl=ssl_ctx) as http_resp:
+                if http_resp.status == http.client.OK:
+                    try:
+                        return await http_resp.read()
+                    except aiohttp.ClientResponseError as err:
+                        print('Config fetch error: %s' % err)
+                else:
+                    print('Config fetch unexpected response: %s %s' % (http_resp.status, http_resp.reason), file=sys.stderr)
+        except OSError as os_err:
+            print("Config fetch error: %s | %s | %s" % (type(os_err), os_err.errno, os_err.strerror), file=sys.stderr)
+
+        return None
+
     async def _fetch(self):
+        shutdown_task = asyncio.Task(self._shutdown_event.wait(), loop=self._event_loop)
+
         url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/callback/config')
 
         ssl_ctx = ssl.SSLContext()
         ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as http_session:
-            while True:
+            while not self._shutdown_event.is_set():
                 conf_bytes = None
-                try:
-                    async with http_session.request('GET', url, ssl=ssl_ctx) as http_resp:
-                        if http_resp.status == http.client.OK:
-                            try:
-                                conf_bytes = await http_resp.read()
-                            except aiohttp.ClientResponseError as err:
-                                print('Error fetching config %s' % err)
-                except asyncio.TimeoutError as err_timeout:
-                    print("Config fetch error: %s | %s | %s" % (type(err_timeout), err_timeout.errno, err_timeout.strerror), file=sys.stderr)
+                fetch_task = asyncio.Task(self._fetch_once(http_session, url, ssl_ctx), loop=self._event_loop)
+                done_tasks, pending_tasks = await asyncio.wait((fetch_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED)
+                if fetch_task in pending_tasks:
+                    fetch_task.cancel()
+                elif fetch_task in done_tasks:
+                    conf_bytes = fetch_task.result()
                 if conf_bytes is not None:
                     conf = json.loads(conf_bytes)
                     self.users = dict(map(lambda user: (
@@ -191,17 +207,19 @@ class RemoteHttp(Base):
                             datetime.datetime.fromisoformat(revoked_card[1][3]),  # revoked-dt
                         )
                     ), conf['revoked_cards'].items()))
-                    self.last_config_dt = datetime.datetime.now(tz=datetime.UTC)
+                    self._last_config_dt = datetime.datetime.now(tz=datetime.UTC)
                     self.ready_event.set()
 
                 if self.ready_event.is_set():
-                    await asyncio.sleep(self.CONFIG_FETCH_INTERVAL.total_seconds())
-                    if datetime.datetime.now(tz=datetime.UTC) - self.last_config_dt > self.CONFIG_INVALIDATE:
-                        self.ready_event.reset()
+                    timer_task = asyncio.Task(asyncio.sleep(self.CONFIG_FETCH_INTERVAL.total_seconds()), loop=self._event_loop)
+                    await asyncio.wait((timer_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED)
+                    timer_task.cancel()
+                    if datetime.datetime.now(tz=datetime.UTC) - self._last_config_dt > self.CONFIG_INVALIDATE:
+                        self.ready_event.clear()
 
     def _fetch_thread(self):
         try:
-            self._event_loop.run_until_complete(self.task)
+            self._event_loop.run_until_complete(self._task)
         except asyncio.CancelledError:
             pass
 
@@ -212,5 +230,6 @@ class RemoteHttp(Base):
         pass  # not supported/needed
 
     def shutdown(self):
-        self.task.cancel()
+        self._task.cancel()
+        self._shutdown_event.set()
 
