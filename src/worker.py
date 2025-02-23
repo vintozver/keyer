@@ -125,6 +125,7 @@ def main():
     http_thread = threading.Thread(target=http_thread_worker, name="http")
 
     def signal_term(sig, frame):
+        print("signal %s, acting ..." % sig)
         lcd.color = (0, 0, 0)
         lcd.message = "UNAVAILABLE     \nplease wait ... "
         dispatcher.shutdown()
