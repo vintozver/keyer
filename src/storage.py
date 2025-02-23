@@ -167,7 +167,7 @@ class RemoteHttp(Base):
     async def _fetch(self):
         shutdown_task = asyncio.Task(self._shutdown_event.wait(), loop=self._event_loop)
 
-        url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/callback/config')
+        url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/config')
 
         ssl_ctx = ssl.SSLContext()
         ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
