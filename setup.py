@@ -15,6 +15,6 @@ setup(
     install_requires=[
         'adafruit_circuitpython_pn532', 'adafruit_circuitpython_charlcd',
         'gpiozero', 'pigpio', 'ecdsa', 'aiodns', 'aiohttp',
-        'PyYAML>=6.0.3', 'PyJWT[crypto]>=2.15.1',
+        'PyYAML', 'PyJWT[crypto]',
     ],
 )
