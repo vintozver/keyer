@@ -8,6 +8,7 @@ import binascii
 import datetime
 import http.client
 import json
+import jwt
 import pprint
 import ssl
 import sys
@@ -142,6 +143,8 @@ class RemoteHttp(Base):
 
     def __init__(self):
         super(RemoteHttp, self).__init__()
+        with open(_config.control_privatekey, "rb") as f:
+            self._private_key = f.read()
         self._shutdown_event = asyncio.Event()
         self._last_config_dt = datetime.datetime.min
         self._event_loop = asyncio.events.new_event_loop()
@@ -150,8 +153,21 @@ class RemoteHttp(Base):
         config_fetch.start()
 
     async def _fetch_once(self, http_session: aiohttp.ClientSession, url: yarl.URL, ssl_ctx: ssl.SSLContext) -> typing.Optional[bytes]:
+        token = jwt.encode(
+            {},
+            self._private_key,
+            algorithm=_config.control_algorithm,
+            headers={
+                'unit_id': _config.unit_id,
+                'kid': _config.kid,
+                'dt': datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            },
+        )
         try:
-            async with http_session.request('GET', url, ssl=ssl_ctx) as http_resp:
+            async with http_session.request(
+                    'GET', url, ssl=ssl_ctx,
+                    headers={'Authorization': 'Bearer ' + token},
+                    allow_redirects=False) as http_resp:
                 if http_resp.status == http.client.OK:
                     try:
                         return await http_resp.read()
@@ -169,7 +185,7 @@ class RemoteHttp(Base):
 
         url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/config')
 
-        ssl_ctx = ssl.SSLContext()
+        ssl_ctx = ssl.create_default_context()
         ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as http_session:
             while not self._shutdown_event.is_set():
@@ -232,4 +248,3 @@ class RemoteHttp(Base):
     def shutdown(self):
         self._task.cancel()
         self._shutdown_event.set()
-

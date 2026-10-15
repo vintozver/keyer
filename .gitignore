@@ -2,7 +2,7 @@ build/
 __pycache__/
 *.egg-info/
 config.txt
+config.yaml
 users.txt
 issued_cards.txt
 revoked_cards.txt
-
