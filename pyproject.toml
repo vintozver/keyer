@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keyer"
+version = "1.0"
+description = "MIFARE Classic 1K EV premises access system (embedded part)."
+authors = [
+    { name = "Vitaly Greck", email = "vintozver@ya.ru" },
+]
+dependencies = [
+    "adafruit_circuitpython_pn532",
+    "adafruit_circuitpython_charlcd",
+    "gpiozero",
+    "pigpio",
+    "ecdsa",
+    "aiodns",
+    "aiohttp",
+    "PyYAML",
+    "PyJWT[crypto]",
+]
+
+[project.urls]
+Homepage = "https://github.com/vintozver/keyer"
+
+[tool.setuptools]
+packages = ["keyer"]
+package-dir = { keyer = "src" }
