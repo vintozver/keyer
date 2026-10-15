@@ -8,6 +8,7 @@ import binascii
 import datetime
 import http.client
 import json
+import jwt
 import pprint
 import ssl
 import sys
@@ -16,7 +17,23 @@ import typing
 import uuid
 import yarl
 
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, rsa
+
 from . import config as _config
+
+
+def _certificate_algorithm(certificate: bytes) -> str:
+    public_key = x509.load_pem_x509_certificate(certificate).public_key()
+    if isinstance(public_key, rsa.RSAPublicKey):
+        return 'RS256'
+    if isinstance(public_key, ec.EllipticCurvePublicKey):
+        algorithms = {'secp256r1': 'ES256', 'secp384r1': 'ES384', 'secp521r1': 'ES512'}
+        if public_key.curve.name in algorithms:
+            return algorithms[public_key.curve.name]
+    if isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+        return 'EdDSA'
+    raise ValueError("Certificate public key is not supported for JWT signing")
 
 
 class Base(object):
@@ -142,6 +159,10 @@ class RemoteHttp(Base):
 
     def __init__(self):
         super(RemoteHttp, self).__init__()
+        with open(_config.control_privatekey, "rb") as f:
+            self._private_key = f.read()
+        with open(_config.control_certificate, "rb") as f:
+            self._algorithm = _certificate_algorithm(f.read())
         self._shutdown_event = asyncio.Event()
         self._last_config_dt = datetime.datetime.min
         self._event_loop = asyncio.events.new_event_loop()
@@ -150,8 +171,21 @@ class RemoteHttp(Base):
         config_fetch.start()
 
     async def _fetch_once(self, http_session: aiohttp.ClientSession, url: yarl.URL, ssl_ctx: ssl.SSLContext) -> typing.Optional[bytes]:
+        token = jwt.encode(
+            {},
+            self._private_key,
+            algorithm=self._algorithm,
+            headers={
+                'unit_id': _config.unit_id,
+                'kid': _config.kid,
+                'dt': datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            },
+        )
         try:
-            async with http_session.request('GET', url, ssl=ssl_ctx) as http_resp:
+            async with http_session.request(
+                    'GET', url, ssl=ssl_ctx,
+                    headers={'Authorization': 'Bearer ' + token},
+                    allow_redirects=False) as http_resp:
                 if http_resp.status == http.client.OK:
                     try:
                         return await http_resp.read()
@@ -169,7 +203,7 @@ class RemoteHttp(Base):
 
         url = yarl.URL.build(scheme='https', host=_config.control_endpoint, path='/config')
 
-        ssl_ctx = ssl.SSLContext()
+        ssl_ctx = ssl.create_default_context()
         ssl_ctx.load_cert_chain(_config.control_certificate, _config.control_privatekey)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as http_session:
             while not self._shutdown_event.is_set():
@@ -232,4 +266,3 @@ class RemoteHttp(Base):
     def shutdown(self):
         self._task.cancel()
         self._shutdown_event.set()
-
