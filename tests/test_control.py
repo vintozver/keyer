@@ -8,16 +8,17 @@ from unittest import mock
 import jwt
 import yaml
 import yarl
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 
 
 CONFIG = {
     'title1': 'Premises',
     'title2': 'Access control',
-    'unit_id': '0123456789abcdef01234567',
-    'kid': 'primary',
     'control': {
+        'unit_id': '0123456789abcdef01234567',
+        'kid': 'primary',
         'endpoint': 'control.example.com',
         'certificate': '/etc/keyer/unit.crt',
         'privatekey': '/etc/keyer/unit.key',
@@ -44,12 +45,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.title2, 'Access control')
         self.assertFalse(config.local_storage)
         self.assertFalse(config.validate_sig_mifare_classic_ev1)
-        self.assertEqual(config.unit_id, CONFIG['unit_id'])
-        self.assertEqual(config.kid, CONFIG['kid'])
+        self.assertEqual(config.unit_id, CONFIG['control']['unit_id'])
+        self.assertEqual(config.kid, CONFIG['control']['kid'])
         self.assertEqual(config.control_endpoint, CONFIG['control']['endpoint'])
         self.assertEqual(config.control_certificate, CONFIG['control']['certificate'])
         self.assertEqual(config.control_privatekey, CONFIG['control']['privatekey'])
-        self.assertEqual(config.control_algorithm, 'RS256')
 
     def test_explicit_boolean_options(self):
         config = self.load_config(yaml.safe_dump({
@@ -67,24 +67,75 @@ class ConfigTests(unittest.TestCase):
         for name in ('unit_id', 'kid'):
             for value in (None, '', 123):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                    self.load_config(yaml.safe_dump({**CONFIG, name: value}))
+                    self.load_config(yaml.safe_dump({
+                        **CONFIG, 'control': {**CONFIG['control'], name: value},
+                    }))
 
-    def test_asymmetric_algorithm_can_be_selected(self):
-        config = self.load_config(yaml.safe_dump({
-            **CONFIG, 'control': {**CONFIG['control'], 'algorithm': 'ES256'},
-        }))
-        self.assertEqual(config.control_algorithm, 'ES256')
-
-    def test_insecure_algorithms_are_rejected(self):
-        for algorithm in ('none', 'HS256', 'unknown'):
-            with self.subTest(algorithm=algorithm), self.assertRaises(ValueError):
-                self.load_config(yaml.safe_dump({
-                    **CONFIG, 'control': {**CONFIG['control'], 'algorithm': algorithm},
-                }))
+    def test_identity_settings_are_required_under_control(self):
+        for name in ('unit_id', 'kid'):
+            config = {**CONFIG, name: CONFIG['control'][name], 'control': dict(CONFIG['control'])}
+            del config['control'][name]
+            with self.subTest(name=name), self.assertRaises(KeyError):
+                self.load_config(yaml.safe_dump(config))
 
     def test_unsafe_yaml_is_rejected(self):
         with self.assertRaises(yaml.constructor.ConstructorError):
             self.load_config('!!python/object/apply:builtins.dict []')
+
+
+class CertificateAlgorithmTests(unittest.TestCase):
+    @staticmethod
+    def certificate(key, issuer_key=None):
+        issuer_key = issuer_key or key
+        name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, 'keyer test')])
+        now = datetime.datetime.now(tz=datetime.UTC)
+        algorithm = None if isinstance(
+            issuer_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey),
+        ) else hashes.SHA256()
+        return (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(issuer_key, algorithm)
+            .public_bytes(serialization.Encoding.PEM)
+        )
+
+    def test_supported_certificate_keys_produce_verifiable_tokens(self):
+        cases = (
+            (rsa.generate_private_key(public_exponent=65537, key_size=2048), 'RS256'),
+            (ec.generate_private_key(ec.SECP256R1()), 'ES256'),
+            (ec.generate_private_key(ec.SECP384R1()), 'ES384'),
+            (ec.generate_private_key(ec.SECP521R1()), 'ES512'),
+            (ed25519.Ed25519PrivateKey.generate(), 'EdDSA'),
+            (ed448.Ed448PrivateKey.generate(), 'EdDSA'),
+        )
+        for key, expected in cases:
+            with self.subTest(key=type(key).__name__, algorithm=expected):
+                algorithm = storage._certificate_algorithm(self.certificate(key))
+                self.assertEqual(algorithm, expected)
+                token = jwt.encode({}, key, algorithm=algorithm)
+                self.assertEqual(jwt.decode(token, key.public_key(), algorithms=[expected]), {})
+
+    def test_certificate_subject_key_not_issuer_signature_determines_algorithm(self):
+        key = ec.generate_private_key(ec.SECP384R1())
+        issuer = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.assertEqual(storage._certificate_algorithm(self.certificate(key, issuer)), 'ES384')
+
+    def test_unsupported_keys_and_curves_are_rejected(self):
+        for key in (
+            dsa.generate_private_key(key_size=2048),
+            ec.generate_private_key(ec.SECP256K1()),
+        ):
+            with self.subTest(key=type(key).__name__), self.assertRaises(ValueError):
+                storage._certificate_algorithm(self.certificate(key))
+
+    def test_invalid_certificate_is_rejected(self):
+        with self.assertRaises(ValueError):
+            storage._certificate_algorithm(b'not a certificate')
 
 
 class RemoteHttpTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +151,7 @@ class RemoteHttpTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.remote = object.__new__(storage.RemoteHttp)
         self.remote._private_key = self.private_key
+        self.remote._algorithm = 'RS256'
         self.session = mock.MagicMock()
         self.response = mock.AsyncMock()
         self.response.status = 200
@@ -125,8 +177,8 @@ class RemoteHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jwt.decode(token, self.key.public_key(), algorithms=['RS256']), {})
         headers = jwt.get_unverified_header(token)
         self.assertEqual(headers['alg'], 'RS256')
-        self.assertEqual(headers['unit_id'], CONFIG['unit_id'])
-        self.assertEqual(headers['kid'], CONFIG['kid'])
+        self.assertEqual(headers['unit_id'], CONFIG['control']['unit_id'])
+        self.assertEqual(headers['kid'], CONFIG['control']['kid'])
         timestamp = datetime.datetime.fromisoformat(headers['dt'])
         self.assertGreaterEqual(timestamp, before)
         self.assertLessEqual(timestamp, after)
@@ -162,3 +214,22 @@ class RemoteHttpTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FileNotFoundError):
                 storage.RemoteHttp()
         thread.assert_not_called()
+
+    def test_algorithm_is_loaded_from_configured_certificate_before_startup(self):
+        certificate = CertificateAlgorithmTests.certificate(self.key)
+        files = [
+            mock.mock_open(read_data=self.private_key).return_value,
+            mock.mock_open(read_data=certificate).return_value,
+        ]
+        with mock.patch('builtins.open', side_effect=files) as open_file, \
+                mock.patch.object(storage.threading, 'Thread'), \
+                mock.patch.object(storage.asyncio.events, 'new_event_loop'), \
+                mock.patch.object(storage.asyncio, 'Task'), \
+                mock.patch.object(storage.RemoteHttp, '_fetch', new=mock.Mock()):
+            remote = storage.RemoteHttp()
+        self.assertEqual(remote._algorithm, 'RS256')
+        self.assertEqual(remote._private_key, self.private_key)
+        self.assertEqual(open_file.call_args_list, [
+            mock.call(CONFIG['control']['privatekey'], 'rb'),
+            mock.call(CONFIG['control']['certificate'], 'rb'),
+        ])

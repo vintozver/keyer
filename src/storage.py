@@ -17,7 +17,23 @@ import typing
 import uuid
 import yarl
 
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, rsa
+
 from . import config as _config
+
+
+def _certificate_algorithm(certificate: bytes) -> str:
+    public_key = x509.load_pem_x509_certificate(certificate).public_key()
+    if isinstance(public_key, rsa.RSAPublicKey):
+        return 'RS256'
+    if isinstance(public_key, ec.EllipticCurvePublicKey):
+        algorithms = {'secp256r1': 'ES256', 'secp384r1': 'ES384', 'secp521r1': 'ES512'}
+        if public_key.curve.name in algorithms:
+            return algorithms[public_key.curve.name]
+    if isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+        return 'EdDSA'
+    raise ValueError("Certificate public key is not supported for JWT signing")
 
 
 class Base(object):
@@ -145,6 +161,8 @@ class RemoteHttp(Base):
         super(RemoteHttp, self).__init__()
         with open(_config.control_privatekey, "rb") as f:
             self._private_key = f.read()
+        with open(_config.control_certificate, "rb") as f:
+            self._algorithm = _certificate_algorithm(f.read())
         self._shutdown_event = asyncio.Event()
         self._last_config_dt = datetime.datetime.min
         self._event_loop = asyncio.events.new_event_loop()
@@ -156,7 +174,7 @@ class RemoteHttp(Base):
         token = jwt.encode(
             {},
             self._private_key,
-            algorithm=_config.control_algorithm,
+            algorithm=self._algorithm,
             headers={
                 'unit_id': _config.unit_id,
                 'kid': _config.kid,
