@@ -50,16 +50,29 @@ Unsigned and HMAC tokens are not supported. YAML is loaded with PyYAML's safe lo
 In remote mode (`local_storage: false`), the unit queues `card_tap`,
 `card_personalize`, and `card_format` events in memory and uploads to
 `https://<control.endpoint>/log` every five seconds, independently of configuration
-refreshes. Taps include denied and unknown cards, once per physical presentation;
-personalization and formatting are logged only on success. User ObjectIds from
-`/config`'s `user_ids` mapping and names are captured at collection time, after
-ownership verification for taps and before deleting card records for formatting.
-Unknown users have `user_id: null` and `name: ""`. Remote unlocks and revocations
-are logged only by the controller.
+refreshes. Taps with a readable card UUID include denied and unknown cards, once
+per physical presentation; personalization and formatting are logged only on
+success. A tap without a readable, valid UUID is denied and reported locally to
+stderr, not uploaded with a fabricated identifier. The controller resolves user
+identity from issued/revoked cards; the unit sends no email, user ID, or name.
+Remote unlocks and revocations are logged only by the controller.
+
+The request body is a top-level JSON array. Each entry contains exactly `oid`
+(event ObjectId), `event` (event type), and `card_id` (card UUID):
+
+```json
+[
+  {
+    "oid": "6aefe9c80000000000000001",
+    "event": "card_tap",
+    "card_id": "12345678-1234-5678-1234-567812345678"
+  }
+]
+```
 
 Each request uses the same validated HTTPS, client certificate and fresh signed
 bearer JWT as `/config`. Batches contain at most 1000 events and 1 MiB of JSON.
-Event ObjectIds and identity snapshots never change on retry. Only HTTP 200 with
+Event ObjectIds, types, and card UUIDs never change on retry. Only HTTP 200 with
 an exact set of accepted ObjectIds removes a batch; all other responses,
 timeouts, or malformed acknowledgements retain it unchanged. Retries back off
 from five seconds to at most 60 seconds, even while configuration is unavailable.
@@ -71,8 +84,8 @@ The queue holds at most 10,000 events. Overflow prints an error and raises
 Shutdown attempts to drain the queue within five seconds, then reports pending
 events. **Restart or power loss loses pending events**: this is not durable
 storage; disk-backed buffering is a separate reliability improvement.
-Local-file mode deliberately does not buffer or upload events: its files have no
-controller user-id mapping, and it does not load controller signing credentials.
+Local-file mode deliberately does not buffer or upload events: it does not load
+controller signing credentials or run an uploader.
 Use remote mode for controller log coverage.
 
 Deploy compatible controller and firmware changes together before relying on

@@ -49,7 +49,6 @@ class Base(object):
         self._events_lock = threading.Lock()
         self._events = collections.deque()
         self._pending_batch = ()
-        self.user_ids = {}
 
         self.issued_cards = {
             # uuid.UUID -> access_key_B(6-byte), email, dt-created(UTC)
@@ -64,19 +63,18 @@ class Base(object):
             #   *(unlimited access), S(scheduled access, 2 bytes scheduler identifier follow)
         }
 
-    def enqueue_event(self, event: str, email: typing.Optional[str] = None):
+    def enqueue_event(self, event: str, card_id: uuid.UUID):
         if event not in ('card_tap', 'card_personalize', 'card_format'):
             raise ValueError("Unsupported unit event")
+        if not isinstance(card_id, uuid.UUID):
+            raise ValueError("Card event requires a UUID")
         with self._events_lock:
-            user = self.users.get(email)
-            user_id = self.user_ids.get(email) if user is not None else None
             record = json.dumps({
                 'oid': str(ObjectId()),
-                'user_id': user_id,
-                'name': user[0] if user_id is not None else '',
                 'event': event,
+                'card_id': str(card_id),
             }, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
-            if len(record) + len(b'{"events":[]}') > self.EVENT_BATCH_BYTES:
+            if len(record) + len(b'[]') > self.EVENT_BATCH_BYTES:
                 raise ValueError("Card event exceeds upload size limit")
             if len(self._events) >= self.EVENT_QUEUE_LIMIT:
                 print("Card event queue full; event could not be recorded", file=sys.stderr)
@@ -87,7 +85,7 @@ class Base(object):
         with self._events_lock:
             if not self._pending_batch:
                 batch = []
-                size = len(b'{"events":[]}')
+                size = len(b'[]')
                 for record in self._events:
                     extra = len(record) + bool(batch)
                     if len(batch) == self.EVENT_BATCH_LIMIT or size + extra > self.EVENT_BATCH_BYTES:
@@ -108,8 +106,8 @@ class Base(object):
 
 
 class LocalFile(Base):
-    def enqueue_event(self, event: str, email: typing.Optional[str] = None):
-        pass  # local-file mode has no controller identity mapping or uploader
+    def enqueue_event(self, event: str, card_id: uuid.UUID):
+        pass  # local-file mode has no controller credentials or uploader
 
     def __init__(self):
         super(LocalFile, self).__init__()
@@ -254,7 +252,7 @@ class RemoteHttp(Base):
         batch = self._event_batch()
         if not batch:
             return True
-        body = b'{"events":[' + b','.join(batch) + b']}'
+        body = b'[' + b','.join(batch) + b']'
         try:
             async with http_session.request(
                     'POST', url, ssl=ssl_ctx, data=body,
@@ -354,9 +352,6 @@ class RemoteHttp(Base):
             user[0],
             (user[1][0], user[1][1].encode('ascii'), datetime.datetime.fromisoformat(user[1][2]))
         ), conf['users'].items()))
-        user_ids = dict(conf.get('user_ids', {}))
-        if any(not isinstance(oid, str) or not ObjectId.is_valid(oid) for oid in user_ids.values()):
-            raise ValueError("Invalid controller user_ids")
         issued_cards = dict(map(lambda card: (
             uuid.UUID(card[0]),
             (binascii.unhexlify(card[1][0]), card[1][1], datetime.datetime.fromisoformat(card[1][2]))
@@ -368,7 +363,6 @@ class RemoteHttp(Base):
         ), conf['revoked_cards'].items()))
         with self._events_lock:
             self.users = users
-            self.user_ids = user_ids
             self.issued_cards = issued_cards
             self.revoked_cards = revoked_cards
 

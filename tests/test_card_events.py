@@ -41,10 +41,8 @@ class CardEventTests(unittest.TestCase):
         self.card_uid = b'\x01\x02\x03\x04'
         self.identifier = uuid.uuid4()
         self.email = 'resident@example.com'
-        self.user_id = str(control.storage.ObjectId())
         self.store = self.dispatcher.storage
         self.store.users[self.email] = ('Resident', b'R*', datetime.datetime.now(datetime.UTC))
-        self.store.user_ids[self.email] = self.user_id
         self.card = (b'key123', self.email, datetime.datetime.now(datetime.UTC))
         self.store.issued_cards[self.identifier] = self.card
         self.pn532 = self.dispatcher.pn532
@@ -66,59 +64,75 @@ class CardEventTests(unittest.TestCase):
     def tap(self):
         self.dispatcher.idle_card_tap_process(self.card_uid)
 
-    def assert_event(self, event, known=True):
+    def assert_event(self, event, identifier=None):
         self.assertEqual(len(self.events()), 1)
         record = self.events()[0]
         self.assertEqual(record['event'], event)
-        self.assertEqual(record['user_id'], self.user_id if known else None)
-        self.assertEqual(record['name'], 'Resident' if known else '')
+        self.assertEqual(set(record), {'oid', 'event', 'card_id'})
+        self.assertEqual(record['card_id'], str(identifier or self.identifier))
 
     def test_verified_granted_tap(self):
         self.tap()
         self.assert_event('card_tap')
         self.dispatcher.render_granted.assert_called_once()
 
-    def test_verified_but_denied_tap_keeps_identity(self):
+    def test_verified_but_denied_tap_keeps_card_uuid(self):
         self.store.users[self.email] = ('Resident', b'R?', None)
         self.tap()
         self.assert_event('card_tap')
         self.dispatcher.render_denied.assert_called_once_with('unknown flag')
 
-    def test_unknown_card_tap_has_no_identity(self):
+    def test_unknown_card_tap_sends_card_uuid(self):
         self.store.issued_cards.clear()
         self.tap()
-        self.assert_event('card_tap', known=False)
+        self.assert_event('card_tap')
 
-    def test_failed_ownership_verification_does_not_attach_user(self):
+    def test_failed_ownership_verification_still_sends_card_uuid(self):
         self.pn532.mifare_classic_authenticate_block.side_effect = (
             lambda uid, block, *args: block != 5)
         self.tap()
-        self.assert_event('card_tap', known=False)
+        self.assert_event('card_tap')
         self.dispatcher.render_denied.assert_called_once_with('email hash HX')
 
-    def test_forged_email_hash_does_not_attach_user(self):
+    def test_forged_email_hash_still_sends_card_uuid_without_granting_access(self):
         self.pn532.mifare_classic_read_block.side_effect = lambda block: (
             self.identifier.bytes if block == 4 else b'\x00' * 16)
         self.tap()
-        self.assert_event('card_tap', known=False)
+        self.assert_event('card_tap')
+        self.dispatcher.render_granted.assert_not_called()
         self.dispatcher.render_denied.assert_called_once_with('email hash !')
 
-    def test_missing_user_has_no_identity(self):
+    def test_missing_user_still_sends_card_uuid(self):
         self.store.users.clear()
         self.tap()
-        self.assert_event('card_tap', known=False)
+        self.assert_event('card_tap')
 
     def test_same_denied_presentation_is_logged_only_once_until_removed(self):
-        self.pn532.mifare_classic_authenticate_block.return_value = False
+        self.store.issued_cards.clear()
         self.dispatcher.wait_tap_cycle()
         self.dispatcher.wait_tap_cycle()
-        self.assert_event('card_tap', known=False)
+        self.assert_event('card_tap')
         self.pn532.read_passive_target.return_value = None
         self.dispatcher.wait_tap_cycle()
         self.pn532.read_passive_target.return_value = self.card_uid
         self.dispatcher.wait_tap_cycle()
         self.assertEqual(len(self.events()), 2)
         self.assertNotEqual(self.events()[0]['oid'], self.events()[1]['oid'])
+
+    def test_unreadable_or_invalid_uuid_is_reported_without_fabricating_an_event(self):
+        for identifier in (None, b'short'):
+            with self.subTest(identifier=identifier):
+                self.dispatcher._present_card_uid = None
+                self.pn532.mifare_classic_read_block.side_effect = None
+                self.pn532.mifare_classic_read_block.return_value = identifier
+                with mock.patch.object(dispatcher.sys, 'stderr') as stderr:
+                    self.tap()
+                self.assertTrue(stderr.write.called)
+                self.assertFalse(self.events())
+        self.dispatcher._present_card_uid = None
+        self.pn532.mifare_classic_authenticate_block.return_value = False
+        self.tap()
+        self.assertFalse(self.events())
 
     def test_different_card_is_a_new_presentation(self):
         self.tap()
@@ -128,9 +142,9 @@ class CardEventTests(unittest.TestCase):
     def test_personalization_success_and_no_duplicate_idle_tap(self):
         result = self.dispatcher.personalize_card(self.email)
         self.assertIsNotNone(result)
-        self.assert_event('card_personalize')
+        self.assert_event('card_personalize', result[0])
         self.tap()
-        self.assert_event('card_personalize')
+        self.assert_event('card_personalize', result[0])
 
     def test_personalization_failure_does_not_log_success(self):
         for failed_write in range(7):
@@ -149,7 +163,7 @@ class CardEventTests(unittest.TestCase):
         self.assertIsNone(self.dispatcher.depersonalize_card())
         self.assertFalse(self.events())
 
-    def test_formatting_captures_issued_and_revoked_identity_before_deletion(self):
+    def test_formatting_captures_issued_and_revoked_uuid_before_deletion(self):
         for revoked in (False, True):
             with self.subTest(revoked=revoked):
                 self.store._events.clear()
@@ -159,9 +173,10 @@ class CardEventTests(unittest.TestCase):
                 cards[self.identifier] = self.card + ((datetime.datetime.now(datetime.UTC),) if revoked else ())
                 original = self.store.enqueue_event
 
-                def enqueue(event, email):
+                def enqueue(event, card_id):
                     self.assertIn(self.identifier, cards)
-                    original(event, email)
+                    self.assertEqual(card_id, self.identifier)
+                    original(event, card_id)
 
                 with mock.patch.object(self.store, 'enqueue_event', side_effect=enqueue):
                     self.assertEqual(self.dispatcher.depersonalize_card(), self.identifier)
@@ -200,7 +215,7 @@ class CardEventTests(unittest.TestCase):
             handlers[signal.SIGTERM](signal.SIGTERM, None)
             self.assertTrue(self.dispatcher.shutdown_event.is_set())
             self.store.shutdown.assert_not_called()
-            self.store.enqueue_event('card_personalize', self.email)
+            self.store.enqueue_event('card_personalize', self.identifier)
 
         def flush():
             self.assert_event('card_personalize')

@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 import aiohttp
@@ -20,70 +21,68 @@ storage = control.storage
 class EventQueueTests(unittest.TestCase):
     def setUp(self):
         self.store = storage.Base()
-        self.email = 'resident@example.com'
-        self.user_id = str(ObjectId())
-        self.store.users[self.email] = ('Resident', b'R*', datetime.datetime.now(datetime.UTC))
-        self.store.user_ids[self.email] = self.user_id
+        self.card_id = uuid.uuid4()
 
-    def test_ids_and_identity_are_captured_at_collection_time(self):
+    def test_event_id_and_card_uuid_are_captured_at_collection_time(self):
         before = datetime.datetime.now(datetime.UTC).replace(microsecond=0)
-        self.store.enqueue_event('card_tap', self.email)
-        self.store.users.clear()
-        self.store.user_ids.clear()
+        self.store.enqueue_event('card_tap', self.card_id)
+        self.store.issued_cards.clear()
         event = json.loads(self.store._event_batch()[0])
-        self.assertEqual(set(event), {'oid', 'user_id', 'name', 'event'})
+        self.assertEqual(set(event), {'oid', 'event', 'card_id'})
         self.assertGreaterEqual(ObjectId(event['oid']).generation_time, before)
-        self.assertEqual(event['user_id'], self.user_id)
-        self.assertEqual(event['name'], 'Resident')
-        self.store.enqueue_event('card_tap', self.email)
-        unknown = json.loads(self.store._events[-1])
-        self.assertIsNone(unknown['user_id'])
-        self.assertEqual(unknown['name'], '')
-        self.assertNotEqual(event['oid'], unknown['oid'])
+        self.assertEqual(event['card_id'], str(self.card_id))
+        self.store.enqueue_event('card_tap', self.card_id)
+        self.assertNotEqual(event['oid'], json.loads(self.store._events[-1])['oid'])
+
+    def test_missing_or_invalid_card_uuid_is_rejected(self):
+        for value in (None, 'resident@example.com', str(self.card_id), b'bad'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.store.enqueue_event('card_tap', value)
+        self.assertFalse(self.store._events)
 
     def test_count_boundary(self):
         for _ in range(1001):
-            self.store.enqueue_event('card_tap')
+            self.store.enqueue_event('card_tap', self.card_id)
         self.assertEqual(len(self.store._event_batch()), 1000)
         self.assertEqual(len(self.store._events), 1001)
 
     def test_exact_byte_boundary_and_oversized_event(self):
-        self.store.enqueue_event('card_tap')
+        self.store.enqueue_event('card_tap', self.card_id)
         record = self.store._events[0]
-        self.store.EVENT_BATCH_BYTES = len(b'{"events":[]}') + len(record)
-        self.store.enqueue_event('card_tap')
+        self.store.EVENT_BATCH_BYTES = len(b'[]') + len(record)
+        self.store.enqueue_event('card_tap', self.card_id)
         self.assertEqual(len(self.store._event_batch()), 1)
         self.store.EVENT_BATCH_BYTES -= 1
         with self.assertRaisesRegex(ValueError, 'size limit'):
-            self.store.enqueue_event('card_tap')
+            self.store.enqueue_event('card_tap', self.card_id)
         self.assertEqual(len(self.store._events), 2)
 
-    def test_real_one_mib_boundary_counts_json_escaping(self):
-        self.store.users[self.email] = ('\u2603' * 1000, b'R*', None)
-        for _ in range(200):
-            self.store.enqueue_event('card_tap', self.email)
+    def test_real_one_mib_boundary(self):
+        self.store.EVENT_BATCH_LIMIT = self.store.EVENT_QUEUE_LIMIT
+        for _ in range(10000):
+            self.store.enqueue_event('card_personalize', self.card_id)
         batch = self.store._event_batch()
-        body = b'{"events":[' + b','.join(batch) + b']}'
+        body = b'[' + b','.join(batch) + b']'
         self.assertLessEqual(len(body), 1024 * 1024)
         self.assertGreater(len(body) + 1 + len(self.store._events[len(batch)]), 1024 * 1024)
 
     def test_overflow_is_explicit_and_does_not_evict(self):
         self.store.EVENT_QUEUE_LIMIT = 1
-        self.store.enqueue_event('card_tap')
+        self.store.enqueue_event('card_tap', self.card_id)
         original = tuple(self.store._events)
         with self.assertRaises(queue.Full):
-            self.store.enqueue_event('card_tap')
+            self.store.enqueue_event('card_tap', self.card_id)
         self.assertEqual(tuple(self.store._events), original)
 
     def test_controller_only_events_are_rejected(self):
         for event in ('remote_unlock', 'revocation'):
             with self.assertRaises(ValueError):
-                self.store.enqueue_event(event)
+                self.store.enqueue_event(event, self.card_id)
 
     def test_local_file_mode_does_not_buffer_or_upload(self):
         local = object.__new__(storage.LocalFile)
         storage.Base.__init__(local)
-        local.enqueue_event('card_tap')
+        local.enqueue_event('card_tap', self.card_id)
         self.assertFalse(local._events)
 
 
@@ -106,7 +105,8 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
         self.session.request.return_value.__aenter__.return_value = self.response
         self.url = yarl.URL('https://control.example.com/log')
         self.ssl_ctx = mock.sentinel.ssl_context
-        self.remote.enqueue_event('card_tap')
+        self.card_id = uuid.uuid4()
+        self.remote.enqueue_event('card_tap', self.card_id)
 
     def acknowledge(self):
         return {'accepted': [json.loads(record)['oid'] for record in self.remote._event_batch()]}
@@ -128,11 +128,17 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(header['unit_id'], control.CONFIG['control']['unit_id'])
         self.assertEqual(header['kid'], control.CONFIG['control']['kid'])
         self.assertIsNotNone(datetime.datetime.fromisoformat(header['dt']).tzinfo)
-        self.assertEqual(set(json.loads(kwargs['data'])), {'events'})
+        payload = json.loads(kwargs['data'])
+        self.assertIsInstance(payload, list)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(set(payload[0]), {'oid', 'event', 'card_id'})
+        self.assertTrue(ObjectId.is_valid(payload[0]['oid']))
+        self.assertEqual(payload[0]['event'], 'card_tap')
+        self.assertEqual(uuid.UUID(payload[0]['card_id']), self.card_id)
         self.assertFalse(self.remote._events)
 
     async def test_only_exact_acknowledgements_remove_events(self):
-        self.remote.enqueue_event('card_format')
+        self.remote.enqueue_event('card_format', self.card_id)
         expected = self.acknowledge()['accepted']
         for accepted in (None, [], expected[:1], expected + ['extra'],
                          [expected[0]] * 2, 'not a list', [{}], [1, 2]):
@@ -161,8 +167,8 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.upload())
         original_body = self.session.request.call_args.kwargs['data']
         original_token = self.session.request.call_args.kwargs['headers']['Authorization']
-        self.remote.enqueue_event('card_format')
-        self.remote.users['new@example.com'] = ('Changed', b'R*', None)
+        self.remote.enqueue_event('card_format', uuid.uuid4())
+        self.remote.issued_cards.clear()
         self.response.json.side_effect = None
         self.response.json.return_value = committed
         self.assertTrue(await self.upload())
@@ -192,7 +198,7 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
         def produce():
             started.wait(timeout=2)
             for _ in range(100):
-                self.remote.enqueue_event('card_format')
+                self.remote.enqueue_event('card_format', self.card_id)
             appended.set()
 
         async def response():
@@ -231,7 +237,6 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_config_outage_and_invalid_config_do_not_stop_fetching(self):
         conf = {
             'users': {'resident@example.com': ['Resident', 'R*', '2026-01-01T00:00:00+00:00']},
-            'user_ids': {'resident@example.com': str(ObjectId())},
             'issued_cards': {}, 'revoked_cards': {},
         }
         waits = []
@@ -247,14 +252,14 @@ class EventUploadTests(unittest.IsolatedAsyncioTestCase):
             await self.remote._fetch_config(self.session, self.ssl_ctx)
         self.assertEqual(waits, [10, 60, 300])
         self.assertTrue(self.remote.ready_event.is_set())
-        self.remote.enqueue_event('card_tap', 'resident@example.com')
+        self.remote.enqueue_event('card_tap', self.card_id)
         event = json.loads(self.remote._events[-1])
-        self.assertEqual(event['user_id'], conf['user_ids']['resident@example.com'])
-        self.assertEqual(event['name'], 'Resident')
+        self.assertEqual(event['card_id'], str(self.card_id))
+        self.assertEqual(self.remote.users['resident@example.com'][0], 'Resident')
 
     async def test_final_flush_drains_multiple_batches(self):
         self.remote.EVENT_BATCH_LIMIT = 1
-        self.remote.enqueue_event('card_format')
+        self.remote.enqueue_event('card_format', self.card_id)
         self.response.json.side_effect = lambda: self.acknowledge()
         await self.remote._final_flush(self.session, self.ssl_ctx)
         self.assertEqual(self.session.request.call_count, 2)

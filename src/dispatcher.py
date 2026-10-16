@@ -6,6 +6,7 @@ import gpiozero
 import hashlib
 import os
 import queue
+import sys
 import threading
 import time
 import typing
@@ -220,7 +221,7 @@ class Dispatcher(object):
 
         if ok:
             self.storage.issued_cards[identifier] = (access_key_B, email, dt)
-            self.storage.enqueue_event('card_personalize', email)
+            self.storage.enqueue_event('card_personalize', identifier)
             self.storage.save_issued_cards()
 
             lcd.message = "PERSONALIZING OK\nREMOVE CARD ... "
@@ -256,7 +257,7 @@ class Dispatcher(object):
                 if issued_card is not None:
                     access_key_B = issued_card[0]
                     if self.depersonalize_card_impl(card_uid, access_key_B):
-                        self.storage.enqueue_event('card_format', issued_card[1])
+                        self.storage.enqueue_event('card_format', identifier)
                         del self.storage.issued_cards[identifier]
                         self.storage.save_issued_cards()
                         success = True
@@ -265,7 +266,7 @@ class Dispatcher(object):
                     if revoked_card is not None:
                         access_key_B = revoked_card[0]
                         if self.depersonalize_card_impl(card_uid, access_key_B):
-                            self.storage.enqueue_event('card_format', revoked_card[1])
+                            self.storage.enqueue_event('card_format', identifier)
                             del self.storage.revoked_cards[identifier]
                             self.storage.save_revoked_cards()
                             success = True
@@ -333,12 +334,24 @@ class Dispatcher(object):
         if self._present_card_uid == bytes(card_uid):
             return
         self._present_card_uid = bytes(card_uid)
-        owner = self._card_tap_owner(card_uid)
-        self.storage.enqueue_event('card_tap', owner[1] if owner is not None else None)
+        pn532 = self.pn532
+        identifier = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            identifier = pn532.mifare_classic_read_block(4)
+        try:
+            if identifier is None:
+                raise ValueError("Unreadable card UUID")
+            identifier = uuid.UUID(bytes=bytes(identifier))
+        except ValueError:
+            print("Card tap not logged: unreadable or invalid card UUID", file=sys.stderr)
+            self.render_denied("uuid X")
+            return
+        self.storage.enqueue_event('card_tap', identifier)
+        owner = self._card_tap_owner(card_uid, identifier)
         if owner is not None:
             self._card_tap_access(*owner)
 
-    def _card_tap_owner(self, card_uid: bytes):
+    def _card_tap_owner(self, card_uid: bytes, identifier: uuid.UUID):
         pn532 = self.pn532
 
         if _config.validate_sig_mifare_classic_ev1:
@@ -369,16 +382,6 @@ class Dispatcher(object):
             title2 = pn532.mifare_classic_read_block(2)
         else:
             title2 = None
-
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            identifier = pn532.mifare_classic_read_block(4)
-            if identifier is None:
-                self.render_denied("uuid -")
-                return
-        else:
-            self.render_denied("uuid X")
-            return
-        identifier = uuid.UUID(bytes=identifier)
 
         issued_card = self.storage.issued_cards.get(identifier)
         if issued_card is None:
