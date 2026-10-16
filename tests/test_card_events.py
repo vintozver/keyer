@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import json
 import queue
+import signal
 import sys
 import threading
 import unittest
@@ -13,11 +14,14 @@ import test_control as control
 
 with mock.patch.dict(sys.modules, {
     name: mock.MagicMock() for name in (
-        'gpiozero', 'adafruit_character_lcd', 'adafruit_character_lcd.character_lcd',
-        'adafruit_pn532', 'adafruit_pn532.adafruit_pn532', 'ecdsa',
+        'board', 'busio', 'serial', 'gpiozero', 'gpiozero.pins', 'gpiozero.pins.pigpio',
+        'adafruit_character_lcd', 'adafruit_character_lcd.character_lcd',
+        'adafruit_character_lcd.character_lcd_rgb_i2c',
+        'adafruit_pn532', 'adafruit_pn532.adafruit_pn532', 'adafruit_pn532.uart', 'ecdsa',
     )
 }):
     from src import dispatcher
+    from src import worker
 
 
 class CardEventTests(unittest.TestCase):
@@ -187,3 +191,28 @@ class CardEventTests(unittest.TestCase):
         self.store.EVENT_QUEUE_LIMIT = 0
         with self.assertRaises(queue.Full):
             self.tap()
+
+    def test_signal_waits_for_active_card_operation_before_final_flush(self):
+        handlers = {}
+        self.store.shutdown = mock.Mock()
+
+        def active_operation():
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            self.assertTrue(self.dispatcher.shutdown_event.is_set())
+            self.store.shutdown.assert_not_called()
+            self.store.enqueue_event('card_personalize', self.email)
+
+        def flush():
+            self.assert_event('card_personalize')
+
+        self.store.shutdown.side_effect = flush
+        self.dispatcher.loop = active_operation
+        with mock.patch.object(worker._dispatcher, 'Dispatcher', return_value=self.dispatcher), \
+                mock.patch.object(worker, 'HttpServer'), \
+                mock.patch.object(worker.threading, 'Thread'), \
+                mock.patch.object(worker.os, 'unlink'), \
+                mock.patch.object(worker.os, 'umask'), \
+                mock.patch.object(worker.signal, 'signal',
+                                  side_effect=lambda sig, handler: handlers.update({sig: handler})):
+            worker.main()
+        self.store.shutdown.assert_called_once()
