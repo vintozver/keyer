@@ -6,6 +6,7 @@ import gpiozero
 import hashlib
 import os
 import queue
+import sys
 import threading
 import time
 import typing
@@ -80,10 +81,11 @@ class Dispatcher(object):
             self.storage = _storage.RemoteHttp()
 
         self.state = self.STATE_WAIT_CONFIG
+        self._present_card_uid = None
 
     def shutdown(self):
-        self.storage.shutdown()
         self.shutdown_event.set()
+        self.storage.shutdown()
 
     def render_idle_standby(self):
         self.lcd.message = "ASPGR Game Room \nTAP CARD ...    "
@@ -152,7 +154,9 @@ class Dispatcher(object):
 
         card_uid = pn532.read_passive_target(timeout=5)
         if card_uid is None:
+            self._present_card_uid = None
             return None
+        self._present_card_uid = bytes(card_uid)
 
         identifier = uuid.uuid4()
         access_key_B = os.urandom(6)
@@ -168,7 +172,7 @@ class Dispatcher(object):
                     1, 0, 0,  # block 2
                     0, 1, 1,  # block 3 (sector trailer)
                 )
-                pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
+                ok = pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
             else:
                 lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
                 ok = False
@@ -180,43 +184,44 @@ class Dispatcher(object):
                     0, 1, 1,  # block 6
                     0, 1, 1,  # block 7 (sector trailer)
                 )
-                pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
+                ok = pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + access_key_B)
             else:
                 lcd.message = "BLOCK3 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(1, _config.title1.strip().ljust(16)[:16].encode('ascii'))
+                ok = pn532.mifare_classic_write_block(1, _config.title1.strip().ljust(16)[:16].encode('ascii'))
             else:
                 lcd.message = "BLOCK1 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(2, _config.title2.strip().ljust(16)[:16].encode('ascii'))
+                ok = pn532.mifare_classic_write_block(2, _config.title2.strip().ljust(16)[:16].encode('ascii'))
             else:
                 lcd.message = "BLOCK2 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(4, identifier.bytes)
+                ok = pn532.mifare_classic_write_block(4, identifier.bytes)
             else:
                 lcd.message = "BLOCK4 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(5, email_hash[:16])
+                ok = pn532.mifare_classic_write_block(5, email_hash[:16])
             else:
                 lcd.message = "BLOCK5 NOT AUTHN\nERROR           "
                 ok = False
         if ok:
             if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x61, access_key_B):
-                pn532.mifare_classic_write_block(6, email_hash[16:])
+                ok = pn532.mifare_classic_write_block(6, email_hash[16:])
             else:
                 lcd.message = "BLOCK6 NOT AUTHN\nERROR           "
                 ok = False
 
         if ok:
             self.storage.issued_cards[identifier] = (access_key_B, email, dt)
+            self.storage.enqueue_event('card_personalize', identifier)
             self.storage.save_issued_cards()
 
             lcd.message = "PERSONALIZING OK\nREMOVE CARD ... "
@@ -236,6 +241,7 @@ class Dispatcher(object):
         lcd.color = (100, 100, 100)
 
         card_uid = pn532.read_passive_target(timeout=5)
+        self._present_card_uid = bytes(card_uid) if card_uid is not None else None
         if card_uid is not None:
             success = False
 
@@ -251,6 +257,7 @@ class Dispatcher(object):
                 if issued_card is not None:
                     access_key_B = issued_card[0]
                     if self.depersonalize_card_impl(card_uid, access_key_B):
+                        self.storage.enqueue_event('card_format', identifier)
                         del self.storage.issued_cards[identifier]
                         self.storage.save_issued_cards()
                         success = True
@@ -259,6 +266,7 @@ class Dispatcher(object):
                     if revoked_card is not None:
                         access_key_B = revoked_card[0]
                         if self.depersonalize_card_impl(card_uid, access_key_B):
+                            self.storage.enqueue_event('card_format', identifier)
                             del self.storage.revoked_cards[identifier]
                             self.storage.save_revoked_cards()
                             success = True
@@ -282,25 +290,22 @@ class Dispatcher(object):
 
         if pn532.mifare_classic_authenticate_block(card_uid[-4:], 3, 0x61, access_key_B):
             acl = _utils.access_bits_to_seq(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
-            pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + b'\xff\xff\xff\xff\xff\xff')
+            if not pn532.mifare_classic_write_block(3, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + b'\xff\xff\xff\xff\xff\xff'):
+                return False
         else:
             return False
         if pn532.mifare_classic_authenticate_block(card_uid[-4:], 7, 0x61, access_key_B):
             acl = _utils.access_bits_to_seq(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
-            pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + b'\xff\xff\xff\xff\xff\xff')
+            if not pn532.mifare_classic_write_block(7, b'\xff\xff\xff\xff\xff\xff' + acl + b'\x00' + b'\xff\xff\xff\xff\xff\xff'):
+                return False
         else:
             return False
 
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            pn532.mifare_classic_write_block(1, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 2, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            pn532.mifare_classic_write_block(2, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            pn532.mifare_classic_write_block(4, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 5, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            pn532.mifare_classic_write_block(5, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 6, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            pn532.mifare_classic_write_block(6, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+        for block in (1, 2, 4, 5, 6):
+            if not pn532.mifare_classic_authenticate_block(card_uid[-4:], block, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+                return False
+            if not pn532.mifare_classic_write_block(block, b'\x00' * 16):
+                return False
 
         return True
 
@@ -311,12 +316,10 @@ class Dispatcher(object):
         if card_uid is not None:
             self.idle_card_tap_process(card_uid)
 
-            while pn532.mifare_classic_authenticate_block(card_uid[-4:], 1, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-                time.sleep(1)
-
             self.lcd.color = (0, 0, 0)
             self.state = self.STATE_IDLE_STANDBY
         else:
+            self._present_card_uid = None
             self.state = (self.state + 1) % 2
 
     def wait_config(self):
@@ -328,6 +331,27 @@ class Dispatcher(object):
             self.state = self.STATE_WAIT_CONFIG
 
     def idle_card_tap_process(self, card_uid: bytes):
+        if self._present_card_uid == bytes(card_uid):
+            return
+        self._present_card_uid = bytes(card_uid)
+        pn532 = self.pn532
+        identifier = None
+        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
+            identifier = pn532.mifare_classic_read_block(4)
+        try:
+            if identifier is None:
+                raise ValueError("Unreadable card UUID")
+            identifier = uuid.UUID(bytes=bytes(identifier))
+        except ValueError:
+            print("Card tap not logged: unreadable or invalid card UUID", file=sys.stderr)
+            self.render_denied("uuid X")
+            return
+        self.storage.enqueue_event('card_tap', identifier)
+        owner = self._card_tap_owner(card_uid, identifier)
+        if owner is not None:
+            self._card_tap_access(*owner)
+
+    def _card_tap_owner(self, card_uid: bytes, identifier: uuid.UUID):
         pn532 = self.pn532
 
         if _config.validate_sig_mifare_classic_ev1:
@@ -359,16 +383,6 @@ class Dispatcher(object):
         else:
             title2 = None
 
-        if pn532.mifare_classic_authenticate_block(card_uid[-4:], 4, 0x60, b'\xff\xff\xff\xff\xff\xff'):
-            identifier = pn532.mifare_classic_read_block(4)
-            if identifier is None:
-                self.render_denied("uuid -")
-                return
-        else:
-            self.render_denied("uuid X")
-            return
-        identifier = uuid.UUID(bytes=identifier)
-
         issued_card = self.storage.issued_cards.get(identifier)
         if issued_card is None:
             self.render_denied("unknown card")
@@ -397,7 +411,9 @@ class Dispatcher(object):
         if (email_hash_h + email_hash_l) != hashlib.sha256(email.encode('utf-8')).digest():
             self.render_denied("email hash !")
             return
+        return identifier, email
 
+    def _card_tap_access(self, identifier: uuid.UUID, email: str):
         # now check the user from the database
         user = self.storage.users.get(email)
         if user is not None:
@@ -529,4 +545,3 @@ class Dispatcher(object):
 
         ev.wait()
         return box.value
-

@@ -128,8 +128,7 @@ def main():
         print("signal %s, acting ..." % sig)
         lcd.color = (0, 0, 0)
         lcd.message = "UNAVAILABLE     \nplease wait ... "
-        dispatcher.shutdown()
-        http_srv.shutdown()
+        dispatcher.shutdown_event.set()
 
     def signal_int(sig, frame):
         return signal_term(sig, frame)
@@ -147,4 +146,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

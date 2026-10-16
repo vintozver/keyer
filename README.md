@@ -44,3 +44,53 @@ certificate's public key, not its issuer's signature algorithm: RSA uses RS256;
 EC P-256/P-384/P-521 use ES256/ES384/ES512; Ed25519/Ed448 use EdDSA.
 Other public key types and EC curves are rejected. No algorithm setting is needed.
 Unsigned and HMAC tokens are not supported. YAML is loaded with PyYAML's safe loader.
+
+## Card-event logging
+
+In remote mode (`local_storage: false`), the unit queues `card_tap`,
+`card_personalize`, and `card_format` events in memory and uploads to
+`https://<control.endpoint>/log` every five seconds, independently of configuration
+refreshes. Taps with a readable card UUID include denied and unknown cards, once
+per physical presentation; personalization and formatting are logged only on
+success. A tap without a readable, valid UUID is denied and reported locally to
+stderr, not uploaded with a fabricated identifier. The controller resolves user
+identity from issued/revoked cards; the unit sends no email, user ID, or name.
+Remote unlocks and revocations are logged only by the controller.
+
+The request body is a top-level JSON array. Each entry contains exactly `oid`
+(event ObjectId), `event` (event type), and `card_id` (card UUID):
+
+```json
+[
+  {
+    "oid": "6aefe9c80000000000000001",
+    "event": "card_tap",
+    "card_id": "12345678-1234-5678-1234-567812345678"
+  }
+]
+```
+
+Each request uses the same validated HTTPS, client certificate and fresh signed
+bearer JWT as `/config`. Batches contain at most 1000 events and 1 MiB of JSON.
+Event ObjectIds, types, and card UUIDs never change on retry. Only HTTP 200 with
+an exact set of accepted ObjectIds removes a batch; all other responses,
+timeouts, or malformed acknowledgements retain it unchanged. Retries back off
+from five seconds to at most 60 seconds, even while configuration is unavailable.
+HTTP 400/409 errors are printed to stderr for operator investigation; a rejected
+prefix blocks later events, rather than discarding or rewriting history.
+
+The queue holds at most 10,000 events. Overflow prints an error and raises
+`queue.Full` to the caller (stopping dispatch rather than silently dropping logs).
+Shutdown attempts to drain the queue within five seconds, then reports pending
+events. **Restart or power loss loses pending events**: this is not durable
+storage; disk-backed buffering is a separate reliability improvement.
+Local-file mode deliberately does not buffer or upload events: it does not load
+controller signing credentials or run an uploader.
+Use remote mode for controller log coverage.
+
+Deploy compatible controller and firmware changes together before relying on
+card-event coverage. The controller's MongoDB must be a replica set or sharded
+cluster to support atomic transactional batches; standalone storage returns 503.
+
+Hardware-independent tests use the standard library:
+`python -m unittest discover -s tests -v`.
